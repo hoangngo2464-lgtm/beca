@@ -1,0 +1,1516 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bể Cá IoT v4.5 – Smart Aquarium</title>
+
+<!-- ════ FIREBASE MODULE (chuẩn từ v4 — không dùng compat) ════ -->
+<script type="module">
+  import { initializeApp }                       from "https://www.gstatic.com/firebasejs/10.12.1/firebase-app.js";
+  import { getDatabase, ref, onValue, set, get } from "https://www.gstatic.com/firebasejs/10.12.1/firebase-database.js";
+
+  const FB = {
+    apiKey:            "AIzaSyD5ABq6Ny1OCHYgvmSja8ir10-Ybg4Qlog",
+    authDomain:        "beca3-43b1a.firebaseapp.com",
+    databaseURL:       "https://beca3-43b1a-default-rtdb.firebaseio.com",
+    projectId:         "beca3-43b1a",
+    storageBucket:     "beca3-43b1a.firebasestorage.app",
+    messagingSenderId: "370133272962",
+    appId:             "1:370133272962:web:47ea557ed0914d5c70a79b"
+  };
+
+  try {
+    const app = initializeApp(FB);
+    const db  = getDatabase(app);
+
+    /* ── /realtime ────────────────────────────────── */
+    onValue(ref(db,"realtime"), snap => {
+      try {
+        const d = snap.val(); if (!d) return;
+        // SỬA LỖI CHÍNH: đọc đúng key PascalCase (TDS, Turbidity) như ESP32 ghi
+        S.TDS         = d.TDS        != null ? +d.TDS        : null;
+        S.Turbidity   = d.Turbidity  != null ? +d.Turbidity  : null;
+        S.PumpStatus  = !!d.PumpStatus;
+        S.LightStatus = !!d.LightStatus;
+        S.ControlMode = d.ControlMode != null ? +d.ControlMode : S.ControlMode;
+        S.LightMode   = d.LightMode   != null ? +d.LightMode   : S.LightMode;
+        S.sensorOk    = d.sensorOk !== false;  // mặc định true nếu không có field
+        S.espOffline  = !!d.offline;
+        if (d.Timestamp) window._onTimestamp(d.Timestamp);
+        render();
+      } catch(e) { console.error("[realtime]", e); }
+    });
+
+    /* ── /config ──────────────────────────────────── */
+    onValue(ref(db,"config"), snap => {
+      try {
+        const c = snap.val(); if (!c) return;
+        if (c.ControlMode != null) S.ControlMode = +c.ControlMode;
+        if (c.LightMode   != null) S.LightMode   = +c.LightMode;
+        if (c.tdsTh  != null) { S.tdsTh  = +c.tdsTh;  document.getElementById("tdsThresh").value  = S.tdsTh;  document.getElementById("schTdsVal").textContent  = S.tdsTh  + " ppm"; }
+        if (c.turbTh != null) { S.turbTh = +c.turbTh; document.getElementById("turbThresh").value = S.turbTh; document.getElementById("schTurbVal").textContent = S.turbTh + " %"; }
+        if (c.onHour  != null) { S.onHour  = +c.onHour;  document.getElementById("schOn").value  = S.onHour; }
+        if (c.offHour != null) { S.offHour = +c.offHour; document.getElementById("schOff").value = S.offHour; }
+        if (c.notifMuted != null) { S.notifMuted = !!c.notifMuted; updateMuteUI(); }
+        if (c.otaVersion != null) {
+          const ver = "v" + c.otaVersion;
+          ["current-board-version","ota-cur-ver-detail","statOtaVersion"].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = el.id === "current-board-version" ? "Mạch: "+ver : ver;
+          });
+        }
+        if (c.otaUpdateCount != null) {
+          S.otaUpdateCount = +c.otaUpdateCount;
+          ["ota-update-count","statOtaCount"].forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.textContent = S.otaUpdateCount + (id === "statOtaCount" ? " lần cập nhật" : " lần");
+          });
+        }
+        render();
+      } catch(e) { console.error("[config]", e); }
+    });
+
+    /* ── /ota_status — nhận % tiến trình từ beca_ota.ino ── */
+    onValue(ref(db,"ota_status"), snap => {
+      const o = snap.val();
+      if (o) updateOtaProgressUI(o.status, o.progress || 0);
+    });
+
+    /* ── /History ─────────────────────────────────── */
+    onValue(ref(db,"History"), snap => {
+      try {
+        const v = snap.val();
+        if (!v) return;
+        const entries = Object.values(v)
+          .filter(e => e && e.tds != null)
+          .sort((a,b) => (a.ts||0) - (b.ts||0))
+          .slice(-100);
+        S.histEntries = entries;
+        updateHistCharts();
+        updateHistTable();
+      } catch(e) { console.error("[history]", e); }
+    });
+
+    /* ── Hàm ghi Firebase ─────────────────────────── */
+    window._fbSetMode      = v        => set(ref(db,"config/ControlMode"), v);
+    window._fbSetLight     = v        => set(ref(db,"config/LightMode"), v);
+    window._fbSetSchedule  = (on,off) => { set(ref(db,"config/onHour"),on); set(ref(db,"config/offHour"),off); };
+    window._fbSetThresh    = (t,u)    => { set(ref(db,"config/tdsTh"),t); set(ref(db,"config/turbTh"),u); };
+    window._fbSetNotifMute = m        => set(ref(db,"config/notifMuted"), m);
+    window._fbOtaTrigger   = (ver,url,note) => {
+      set(ref(db,"config/otaVersion"), ver);
+      set(ref(db,"config/otaUrl"), url);
+      if (note) set(ref(db,"config/otaNote"), note);
+      set(ref(db,"ota_status"), {status:0, progress:0});
+    };
+    window._fbOtaCountUp   = () => {
+      S.otaUpdateCount = (S.otaUpdateCount||0) + 1;
+      set(ref(db,"config/otaUpdateCount"), S.otaUpdateCount);
+    };
+
+    window._fbReady = true;
+    document.getElementById("statusFB").textContent  = "Đã kết nối";
+    document.getElementById("statusFB").className    = "status-val linked";
+  } catch(e) {
+    console.error("Firebase init error:", e);
+    window._fbReady = false;
+    document.getElementById("statusFB").textContent  = "Lỗi kết nối";
+    document.getElementById("statusFB").className    = "status-val offline";
+  }
+</script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+
+<style>
+:root {
+  --primary:#2563EB;--primary-light:#3B82F6;--primary-bg:#EFF6FF;
+  --purple:#7C3AED;--purple-light:#8B5CF6;--purple-bg:#F5F3FF;
+  --orange:#F59E0B;--orange-bg:#FFFBEB;
+  --green:#10B981;--green-bg:#ECFDF5;
+  --red:#EF4444;--red-bg:#FEF2F2;
+  --teal:#0EA5E9;--teal-bg:#E0F2FE;
+  --bg-main:#F0F4F8;--bg-sidebar:#FFFFFF;--bg-card:#FFFFFF;--bg-topbar:#FFFFFF;
+  --text-primary:#1E293B;--text-secondary:#64748B;--text-muted:#94A3B8;
+  --border:#E2E8F0;--border-light:#F1F5F9;
+  --shadow-sm:0 1px 3px rgba(0,0,0,0.08);--shadow-md:0 4px 16px rgba(0,0,0,0.1);--shadow-lg:0 8px 32px rgba(0,0,0,0.12);
+  --radius-sm:8px;--radius-md:14px;--radius-lg:20px;--radius-xl:24px;
+  --sidebar-w:240px;--topbar-h:68px;
+  --font-main:'Be Vietnam Pro',sans-serif;--font-mono:'JetBrains Mono',monospace;
+}
+body.dark{
+  --bg-main:#0F172A;--bg-sidebar:#1E293B;--bg-card:#1E293B;--bg-topbar:#1E293B;
+  --border:#334155;--border-light:#334155;
+  --text-primary:#F1F5F9;--text-secondary:#94A3B8;--text-muted:#64748B;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{font-size:14px;scroll-behavior:smooth}
+body{font-family:var(--font-main);background:var(--bg-main);color:var(--text-primary);display:flex;min-height:100vh;overflow-x:hidden;transition:background .3s,color .3s}
+button{font-family:inherit;cursor:pointer;border:none;outline:none}
+
+/* ── SIDEBAR ── */
+.sidebar{width:var(--sidebar-w);background:var(--bg-sidebar);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;left:0;height:100vh;z-index:100;overflow-y:auto;overflow-x:hidden;transition:width .3s;box-shadow:var(--shadow-sm)}
+.sidebar-logo{display:flex;align-items:center;gap:12px;padding:18px 18px 16px;border-bottom:1px solid var(--border-light);background:linear-gradient(135deg,rgba(37,99,235,.04),rgba(124,58,237,.04))}
+.logo-icon{width:42px;height:42px;background:linear-gradient(135deg,var(--primary),var(--purple));border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0;box-shadow:0 4px 12px rgba(37,99,235,.3);animation:logoPulse 4s ease-in-out infinite}
+@keyframes logoPulse{0%,100%{box-shadow:0 4px 12px rgba(37,99,235,.3)}50%{box-shadow:0 4px 20px rgba(37,99,235,.5)}}
+.logo-text h2{font-size:13px;font-weight:800;color:var(--primary);letter-spacing:-.3px}
+.logo-text p{font-size:10px;color:var(--text-muted)}
+.sidebar-nav{padding:12px 10px;flex:1}
+.sidebar-nav li{margin-bottom:3px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:var(--radius-sm);color:var(--text-secondary);font-size:13px;font-weight:500;transition:all .2s;cursor:pointer;position:relative;overflow:hidden}
+.nav-item:hover{background:var(--primary-bg);color:var(--primary);transform:translateX(2px)}
+.nav-item.active{background:var(--primary);color:#fff;box-shadow:0 4px 12px rgba(37,99,235,.3)}
+.nav-item .nav-icon{font-size:16px;width:20px;text-align:center;flex-shrink:0}
+.nav-badge{margin-left:auto;background:var(--red);color:#fff;font-size:10px;font-weight:700;border-radius:99px;padding:1px 7px}
+.nav-section-label{font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1.2px;text-transform:uppercase;padding:10px 14px 5px}
+.sidebar-live{margin:8px 10px;padding:12px 14px;background:linear-gradient(135deg,var(--primary-bg),var(--purple-bg));border:1px solid rgba(37,99,235,.12);border-radius:var(--radius-md)}
+.sidebar-live h4{font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px}
+.live-stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.live-stat{text-align:center;padding:8px 6px;background:var(--bg-card);border-radius:var(--radius-sm);border:1px solid var(--border)}
+.live-stat-val{font-size:16px;font-weight:800;font-family:var(--font-mono);color:var(--primary)}
+.live-stat-lbl{font-size:9px;color:var(--text-muted);font-weight:600;letter-spacing:.5px;margin-top:1px}
+.live-device-row{display:flex;align-items:center;justify-content:space-between;margin-top:8px;padding:5px 0}
+.live-device-row span{font-size:12px;color:var(--text-secondary)}
+.dev-pill{font-size:10px;font-weight:700;padding:2px 9px;border-radius:99px}
+.dev-pill.on{background:var(--green-bg);color:var(--green)}
+.dev-pill.off{background:var(--red-bg);color:var(--red)}
+.sidebar-status{margin:0 10px 8px;padding:12px 14px;border:1px solid var(--border-light);border-radius:var(--radius-md);background:var(--bg-main)}
+.sidebar-status h4{font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:10px}
+.status-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px;font-size:12px}
+.status-row .s-left{display:flex;align-items:center;gap:7px;color:var(--text-secondary)}
+.status-val{font-weight:600;font-size:11px;padding:2px 8px;border-radius:99px}
+.status-val.online{background:var(--green-bg);color:var(--green)}
+.status-val.offline{background:var(--red-bg);color:var(--red)}
+.status-val.linked{background:var(--purple-bg);color:var(--purple)}
+.status-val.pending{background:var(--orange-bg);color:var(--orange)}
+/* ── MAIN ── */
+.main-wrapper{margin-left:var(--sidebar-w);flex:1;display:flex;flex-direction:column;min-height:100vh;transition:margin .3s}
+.offline-banner{display:none;background:var(--red-bg);border-bottom:2px solid var(--red);padding:10px 20px;font-size:12px;font-weight:600;color:var(--red);gap:10px;align-items:center;width:100%}
+.offline-banner.show{display:flex}
+.sensor-banner{display:none;background:var(--orange-bg);border-bottom:2px solid var(--orange);padding:8px 20px;font-size:12px;font-weight:600;color:var(--orange);gap:10px;align-items:center;width:100%}
+.sensor-banner.show{display:flex}
+.topbar{height:var(--topbar-h);background:var(--bg-topbar);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 26px;position:sticky;top:0;z-index:50;gap:16px;box-shadow:var(--shadow-sm)}
+.topbar-greet{flex:1}
+.topbar-greet h1{font-size:18px;font-weight:800;letter-spacing:-.4px}
+.topbar-greet p{font-size:12px;color:var(--text-secondary);margin-top:1px}
+.topbar-right{display:flex;align-items:center;gap:8px}
+.tb-btn{width:36px;height:36px;border-radius:var(--radius-sm);background:var(--bg-main);border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:16px;color:var(--text-secondary);transition:all .2s;cursor:pointer;position:relative}
+.tb-btn:hover{background:var(--primary-bg);color:var(--primary);border-color:var(--primary-light)}
+.tb-badge{position:absolute;top:-4px;right:-4px;background:var(--red);color:#fff;font-size:9px;font-weight:700;border-radius:99px;padding:1px 5px;border:2px solid var(--bg-card)}
+.tb-avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,var(--primary),var(--purple));display:flex;align-items:center;justify-content:center;color:#fff;font-size:14px;font-weight:700;cursor:pointer}
+.content{padding:20px 26px 28px;display:flex;flex-direction:column;gap:20px}
+.panel{display:none;flex-direction:column;gap:20px;animation:panelFadeIn .35s ease}
+.panel.active{display:flex}
+@keyframes panelFadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+/* ── METRIC CARDS ── */
+.metric-row{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+.metric-card{background:var(--bg-card);border-radius:var(--radius-lg);padding:16px 18px;box-shadow:var(--shadow-sm);border:1px solid var(--border);transition:transform .2s,box-shadow .2s;position:relative;overflow:hidden}
+.metric-card:hover{transform:translateY(-3px);box-shadow:var(--shadow-md)}
+.metric-card.alert-card{border-color:var(--red);animation:alertPulse 1s ease-in-out infinite alternate}
+@keyframes alertPulse{from{border-color:var(--red)}to{border-color:rgba(239,68,68,.25)}}
+.mc-header{display:flex;align-items:center;gap:12px}
+.mc-icon{width:44px;height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0}
+.mc-icon.blue{background:var(--primary-bg)}.mc-icon.orange{background:var(--orange-bg)}.mc-icon.teal{background:var(--teal-bg)}.mc-icon.purple{background:var(--purple-bg)}.mc-icon.green{background:var(--green-bg)}
+.mc-label{font-size:11px;color:var(--text-secondary);font-weight:500}
+.mc-value{font-size:22px;font-weight:800;letter-spacing:-.5px;line-height:1}
+.mc-value.blue{color:var(--primary)}.mc-value.orange{color:var(--orange)}.mc-value.teal{color:var(--teal)}.mc-value.purple{color:var(--purple)}.mc-value.green{color:var(--green)}.mc-value.red{color:var(--red)}
+.mc-unit{font-size:12px;font-weight:500;color:var(--text-secondary);margin-left:2px}
+.mc-sub{font-size:11px;color:var(--text-muted);margin-top:2px}
+.toggle-wrap{display:flex;align-items:center;gap:8px;margin-top:6px}
+.toggle{position:relative;width:42px;height:24px}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;inset:0;background:#CBD5E1;border-radius:99px;cursor:pointer;transition:background .25s}
+.toggle-slider::before{content:'';position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:transform .25s}
+.toggle input:checked + .toggle-slider{background:var(--primary)}
+.toggle input:checked + .toggle-slider.orange{background:var(--orange)}
+.toggle input:checked + .toggle-slider::before{transform:translateX(18px)}
+.toggle-label{font-size:11px;color:var(--text-secondary);font-weight:600}
+.progress-bar{height:6px;background:var(--border);border-radius:99px;overflow:hidden;margin-top:6px}
+.progress-fill{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--green),#34D399);transition:width .5s ease}
+/* ── GAUGE TRÒN (TDS + Độ đục) ── */
+.gauge-flex-container{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:8px}
+.circular-progress-ring{position:relative;width:76px;height:76px;border-radius:50%;background:conic-gradient(var(--teal) 0deg,var(--border) 0deg);display:flex;align-items:center;justify-content:center;transition:background .4s ease}
+.circular-progress-ring::before{content:"";position:absolute;width:62px;height:62px;border-radius:50%;background:var(--bg-card)}
+.gauge-inner-text{position:relative;font-family:var(--font-mono);font-size:13px;font-weight:800;color:var(--text-primary);text-align:center}
+.gauge-inner-text span{display:block;font-size:8.5px;color:var(--text-secondary);font-family:var(--font-main);margin-top:-1px}
+/* ── TANK ── */
+.tank-card{background:var(--bg-card);border-radius:var(--radius-xl);box-shadow:var(--shadow-sm);border:1px solid var(--border);overflow:hidden}
+.tank-header{display:flex;align-items:center;justify-content:space-between;padding:15px 20px 13px}
+.tank-title{font-size:14px;font-weight:800}
+.live-badge{display:flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--green)}
+.live-dot{width:9px;height:9px;background:var(--green);border-radius:50%;animation:pulseGreen 1.8s infinite}
+@keyframes pulseGreen{0%,100%{box-shadow:0 0 0 0 rgba(16,185,129,.5)}50%{box-shadow:0 0 0 7px rgba(16,185,129,0)}}
+.tank-body{position:relative;height:220px;overflow:hidden;background:linear-gradient(180deg,#0c4a6e,#075985 30%,#0369a1 70%,#164e63)}
+.fish-scene{position:absolute;inset:0;overflow:hidden}
+.fish{position:absolute;font-size:26px;animation:swimRight linear infinite}
+.fish.left{animation:swimLeft linear infinite;transform:scaleX(-1)}
+@keyframes swimRight{0%{left:-70px}100%{left:calc(100% + 70px)}}
+@keyframes swimLeft{0%{left:calc(100% + 70px)}100%{left:-70px}}
+.bubble{position:absolute;bottom:10px;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.35);border-radius:50%;animation:riseUp ease-in infinite}
+@keyframes riseUp{0%{bottom:5px;opacity:.8;transform:translateX(0)}100%{bottom:110%;opacity:0;transform:translateX(8px)}}
+.seaweed{position:absolute;bottom:0;width:10px;background:linear-gradient(to top,#065f46,#059669);border-radius:6px 6px 0 0;transform-origin:bottom center;animation:sway 3s ease-in-out infinite}
+@keyframes sway{0%,100%{transform:rotate(-8deg) scaleX(.8)}50%{transform:rotate(8deg) scaleX(1.1)}}
+.tank-timestamp{position:absolute;bottom:12px;right:14px;background:rgba(0,0,0,.45);backdrop-filter:blur(6px);color:#fff;font-size:11px;padding:4px 10px;border-radius:8px;z-index:10}
+.tank-water-quality{position:absolute;bottom:12px;left:14px;z-index:10;display:flex;gap:8px}
+.tank-wq-badge{background:rgba(0,0,0,.45);backdrop-filter:blur(6px);color:#fff;font-size:11px;padding:4px 10px;border-radius:8px}
+/* ── AI CARD ── */
+.ai-card{background:var(--bg-card);border-radius:var(--radius-xl);border:1px solid var(--border);box-shadow:var(--shadow-sm);overflow:hidden;padding:18px 20px;display:flex;flex-direction:column;gap:14px}
+.ai-card-header{display:flex;align-items:center;justify-content:space-between}
+.ai-card-header h3{font-size:14px;font-weight:800;display:flex;align-items:center;gap:8px}
+.ai-status-label{font-size:10px;font-weight:700;color:var(--text-muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:4px}
+.ai-status-big{font-size:30px;font-weight:800;letter-spacing:-1px;line-height:1}
+.ai-robot-row{display:flex;align-items:center;gap:14px;background:var(--purple-bg);border-radius:var(--radius-md);padding:14px}
+.ai-robot-icon{width:56px;height:56px;background:linear-gradient(135deg,var(--purple),#A855F7);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0;animation:botPulse 3s ease-in-out infinite}
+@keyframes botPulse{0%,100%{transform:scale(1)}50%{transform:scale(1.06)}}
+.ai-robot-text{flex:1}
+.ai-robot-text h4{font-size:12px;font-weight:700;color:var(--purple)}
+.ai-robot-text p{font-size:11.5px;color:var(--text-secondary);margin-top:2px}
+.ai-suggest-title{font-size:12px;font-weight:700;color:var(--purple);display:flex;align-items:center;gap:5px}
+.ai-suggestions{display:flex;flex-direction:column;gap:6px}
+.ai-suggest-item{display:flex;align-items:flex-start;gap:7px;font-size:12.5px;color:var(--text-secondary);padding:4px 0;border-bottom:1px solid var(--border-light)}
+.ai-suggest-item::before{content:'✓';color:var(--green);font-weight:800;font-size:13px;flex-shrink:0}
+.ai-btn{background:linear-gradient(135deg,var(--purple),#A855F7);color:#fff;border-radius:var(--radius-md);padding:12px 18px;font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:8px;box-shadow:0 4px 12px rgba(124,58,237,.3)}
+.ai-loading{display:none;width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+/* ── OTA STEPS ── */
+.ota-steps-container{display:flex;flex-direction:column;gap:12px;margin-top:6px}
+.ota-step-item{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text-secondary);font-weight:500;transition:color .3s}
+.ota-step-circle{width:22px;height:22px;border-radius:50%;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;font-size:10px;font-family:var(--font-mono);font-weight:700;background:var(--bg-main);color:var(--text-muted)}
+.ota-step-item.active{color:var(--primary);font-weight:700}
+.ota-step-item.active .ota-step-circle{border-color:var(--primary);background:var(--primary-bg);color:var(--primary)}
+.ota-step-item.success{color:var(--text-primary)}
+.ota-step-item.success .ota-step-circle{background:var(--green);border-color:var(--green);color:white}
+.ota-step-item.failure{color:var(--red);font-weight:700}
+.ota-step-item.failure .ota-step-circle{background:var(--red);border-color:var(--red);color:white}
+.ota-progress-wrapper{width:100%;height:6px;background:var(--border);border-radius:10px;overflow:hidden;margin-top:4px}
+.ota-progress-fill-bar{width:0%;height:100%;background:var(--primary);border-radius:10px;transition:width .4s ease}
+/* ── GRID LAYOUTS ── */
+.row2{display:grid;grid-template-columns:1fr 360px;gap:20px}
+.row3{display:grid;grid-template-columns:1fr 1fr 300px;gap:20px}
+.row3-overview{display:grid;grid-template-columns:260px 1fr 240px;gap:16px;align-items:start}
+/* ── CARD ── */
+.card{background:var(--bg-card);border-radius:var(--radius-xl);border:1px solid var(--border);box-shadow:var(--shadow-sm);overflow:hidden}
+.card-header{display:flex;align-items:center;justify-content:space-between;padding:15px 20px;border-bottom:1px solid var(--border)}
+.card-header h3{font-size:14px;font-weight:800;color:var(--text-primary)}
+.card-body{padding:18px 20px}
+/* ── STATS ── */
+.stats-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.stat-box{background:var(--bg-main);border-radius:var(--radius-md);padding:12px 14px;display:flex;flex-direction:column;gap:4px}
+.stat-box-icon{font-size:20px}
+.stat-box-label{font-size:10.5px;color:var(--text-muted);font-weight:500}
+.stat-box-value{font-size:18px;font-weight:800;color:var(--text-primary);letter-spacing:-.3px}
+.stat-box-sub{font-size:10.5px;color:var(--text-secondary)}
+/* ── ALERTS ── */
+.alert-item{display:flex;align-items:flex-start;gap:10px;padding:10px 0;border-bottom:1px solid var(--border-light)}
+.alert-ico{width:30px;height:30px;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;font-size:14px;flex-shrink:0}
+.alert-ico.error{background:var(--red-bg)}.alert-ico.warn{background:var(--orange-bg)}.alert-ico.info{background:var(--primary-bg)}.alert-ico.ok{background:var(--green-bg)}
+.alert-body{flex:1;min-width:0}
+.alert-title{font-size:12.5px;font-weight:700}
+.alert-title.error{color:var(--red)}.alert-title.warn{color:var(--orange)}.alert-title.info{color:var(--primary)}.alert-title.ok{color:var(--green)}
+.alert-desc{font-size:11px;color:var(--text-secondary);margin-top:2px;line-height:1.4}
+.alert-time{font-size:10px;color:var(--text-muted);margin-top:3px;font-family:var(--font-mono)}
+/* ── CONTROLS ── */
+.btn-grp{display:flex;gap:10px;margin-bottom:12px}
+.btn{flex:1;padding:10px;border-radius:var(--radius-md);font-size:13px;font-weight:700;border:none;opacity:.65;cursor:pointer;transition:all .15s}
+.btn.active{opacity:1}
+.btn-auto{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.35)}
+.btn-on{background:rgba(14,165,233,.15);color:var(--teal);border:1px solid rgba(14,165,233,.35)}
+.btn-off{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.btn-light-auto{background:rgba(124,58,237,.15);color:var(--purple);border:1px solid rgba(124,58,237,.35)}
+.btn-light-on{background:rgba(245,158,11,.15);color:var(--orange);border:1px solid rgba(245,158,11,.35)}
+.btn-light-off{background:rgba(100,116,139,.15);color:var(--text-muted);border:1px solid rgba(100,116,139,.3)}
+.btn.active.btn-auto{background:rgba(16,185,129,.25);box-shadow:0 3px 10px rgba(16,185,129,.3)}
+.btn.active.btn-on{background:rgba(14,165,233,.25);box-shadow:0 3px 10px rgba(14,165,233,.3)}
+.btn.active.btn-off{background:rgba(239,68,68,.25);box-shadow:0 3px 10px rgba(239,68,68,.3)}
+.btn.active.btn-light-auto{background:rgba(124,58,237,.25);box-shadow:0 3px 10px rgba(124,58,237,.3)}
+.btn.active.btn-light-on{background:rgba(245,158,11,.25);box-shadow:0 3px 10px rgba(245,158,11,.3)}
+.mbadge{display:inline-block;margin-top:8px;padding:3px 12px;border-radius:99px;font-size:11px;font-family:var(--font-mono);background:var(--primary-bg);color:var(--primary)}
+.status-bar{display:flex;align-items:center;gap:8px;padding:8px 12px;border-radius:var(--radius-md);background:var(--bg-main);font-size:12px;font-family:var(--font-mono);margin-top:10px}
+.sdot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.sdot.on{background:var(--green);animation:pulseGreen 1.5s infinite}
+.sdot.off{background:var(--red)}
+.stxt.on{color:var(--green)}.stxt.off{color:var(--red)}
+/* ── FORM ── */
+.field-row{display:flex;align-items:center;gap:10px;margin-bottom:14px}
+.field-row label{font-size:12px;font-weight:600;color:var(--text-secondary);min-width:85px}
+.field-row input[type="number"]{width:72px;padding:8px 10px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;font-family:var(--font-mono);background:var(--bg-main);color:var(--text-primary)}
+.field-row input[type="text"],.field-row input[type="password"]{flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);font-size:12px;font-family:var(--font-mono);background:var(--bg-main);color:var(--text-primary)}
+.field-row input:focus{outline:none;border-color:var(--primary)}
+.range-row{margin-bottom:16px}
+.range-label{display:flex;justify-content:space-between;font-size:12px;font-family:var(--font-mono);color:var(--text-secondary);margin-bottom:6px}
+.range-label span{color:var(--primary);font-weight:700}
+input[type="range"]{width:100%;accent-color:var(--primary)}
+.save-btn{background:var(--primary);color:#fff;border:none;border-radius:var(--radius-md);padding:9px 18px;font-size:12px;font-weight:700;cursor:pointer;transition:opacity .2s}
+.save-btn:hover{opacity:.85}
+.save-btn.green{background:var(--green)}
+.save-btn.red{background:var(--red)}
+/* ── HIST TABLE ── */
+.hist-table{width:100%;border-collapse:collapse;font-size:12px}
+.hist-table th{background:var(--bg-main);padding:10px 12px;text-align:left;font-family:var(--font-mono);font-size:10.5px;font-weight:700;color:var(--text-muted);border-bottom:1px solid var(--border)}
+.hist-table td{padding:8px 12px;border-bottom:1px solid var(--border-light);font-family:var(--font-mono)}
+.badge-on{background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700}
+.badge-off{background:var(--red-bg);color:var(--red);padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700}
+.badge-warn{background:var(--orange-bg);color:var(--orange);padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700}
+.badge-ok{background:var(--green-bg);color:var(--green);padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700}
+.badge-offline{background:var(--purple-bg);color:var(--purple);padding:2px 8px;border-radius:99px;font-size:10px;font-weight:700}
+/* ── MUTE BOX ── */
+.mute-box{background:var(--bg-main);border-radius:var(--radius-md);padding:16px;margin-bottom:16px}
+.mute-row{display:flex;align-items:center;gap:14px}
+.mute-icon{font-size:28px}
+.mute-info{flex:1}
+.mute-info strong{display:block;font-size:13px;font-weight:700}
+.mute-info small{font-size:11px;color:var(--text-muted);line-height:1.5}
+.mute-btn-el{padding:8px 16px;border-radius:var(--radius-md);font-size:12px;font-weight:700;cursor:pointer;border:none}
+.mute-btn-el.muting{background:var(--orange-bg);color:var(--orange);border:1px solid rgba(245,158,11,.3)}
+.mute-btn-el.unmuting{background:var(--green-bg);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.mute-status-row{display:flex;align-items:center;gap:8px;margin-top:10px;font-size:12px;font-family:var(--font-mono);padding:8px 12px;border-radius:var(--radius-sm);background:var(--bg-card);border:1px solid var(--border)}
+/* ── SETTINGS TABS ── */
+.settings-tabs{display:flex;gap:4px;background:var(--bg-main);border-radius:var(--radius-md);padding:4px;margin-bottom:18px;border:1px solid var(--border)}
+.stab{flex:1;padding:8px 12px;text-align:center;font-size:12px;font-weight:600;color:var(--text-secondary);border-radius:var(--radius-sm);cursor:pointer;border:none;background:none}
+.stab.active{background:var(--bg-card);color:var(--primary);box-shadow:var(--shadow-sm)}
+.spane{display:none}.spane.active{display:block}
+/* ── CHAT ── */
+.chat-container{border:1px solid var(--border);border-radius:var(--radius-md);overflow:hidden}
+.chat-msgs{height:300px;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;background:var(--bg-main)}
+.msg-bubble-user{background:var(--primary);color:#fff;padding:9px 13px;border-radius:12px 12px 2px 12px;max-width:80%;align-self:flex-end;font-size:13px}
+.msg-bubble-ai{background:var(--bg-card);color:var(--text-primary);padding:9px 13px;border-radius:12px 12px 12px 2px;max-width:80%;align-self:flex-start;font-size:13px;border:1px solid var(--border)}
+.chat-input-row{display:flex;border-top:1px solid var(--border);background:var(--bg-card)}
+.chat-input-row textarea{flex:1;padding:12px 14px;border:none;resize:none;background:transparent;color:var(--text-primary);font-family:var(--font-main);font-size:13px;outline:none;height:44px}
+.chat-send-btn{padding:0 18px;background:var(--primary);color:#fff;font-size:16px;border:none;cursor:pointer}
+/* ── TOAST ── */
+.toast-container{position:fixed;top:80px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+.toast{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-md);padding:12px 16px;box-shadow:var(--shadow-lg);display:flex;align-items:center;gap:10px;min-width:280px;font-size:13px;transition:opacity .3s}
+.toast.error{border-left:4px solid var(--red)}.toast.warn{border-left:4px solid var(--orange)}.toast.info{border-left:4px solid var(--primary)}
+.page-header{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius-xl);padding:18px 22px;display:flex;align-items:center;justify-content:space-between;box-shadow:var(--shadow-sm)}
+.page-header-left h2{font-size:16px;font-weight:800;letter-spacing:-.3px}
+.page-header-left p{font-size:12px;color:var(--text-secondary);margin-top:2px}
+@media(max-width:1280px){.metric-row{grid-template-columns:repeat(3,1fr)}.row2{grid-template-columns:1fr}.row3{grid-template-columns:1fr 1fr}.row3-overview{grid-template-columns:1fr 1fr}}
+@media(max-width:900px){:root{--sidebar-w:0px}.sidebar{display:none}.metric-row{grid-template-columns:1fr 1fr}.row3{grid-template-columns:1fr}.row3-overview{grid-template-columns:1fr}}
+@media(max-width:600px){.metric-row{grid-template-columns:1fr}.content{padding:14px}}
+</style>
+</head>
+<body>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<aside class="sidebar">
+  <div class="sidebar-logo">
+    <div class="logo-icon">🐠</div>
+    <div class="logo-text"><h2>BỂ CÁ IoT v4.5</h2><p>Smart Aquarium System</p></div>
+  </div>
+  <nav class="sidebar-nav">
+    <div class="nav-section-label">Menu chính</div>
+    <ul>
+      <li><div class="nav-item active" onclick="showPanel('overview',this)"><span class="nav-icon">🏠</span>Tổng quan</div></li>
+      <li><div class="nav-item" onclick="showPanel('control',this)"><span class="nav-icon">🎛️</span>Điều khiển</div></li>
+      <li><div class="nav-item" onclick="showPanel('ai',this)"><span class="nav-icon">🤖</span>AI Phân tích</div></li>
+      <li><div class="nav-item" onclick="showPanel('charts',this)"><span class="nav-icon">📈</span>Biểu đồ</div></li>
+      <li><div class="nav-item" onclick="showPanel('history',this)"><span class="nav-icon">🗃️</span>Lịch sử</div></li>
+      <li><div class="nav-item" onclick="showPanel('alerts',this)"><span class="nav-icon">🔔</span>Cảnh báo <span class="nav-badge" id="alertBadge" style="display:none">0</span></div></li>
+      <li><div class="nav-item" onclick="showPanel('ota',this)"><span class="nav-icon">⬆️</span>Cập nhật OTA</div></li>
+      <li><div class="nav-item" onclick="showPanel('settings',this)"><span class="nav-icon">⚙️</span>Cài đặt</div></li>
+    </ul>
+  </nav>
+  <div class="sidebar-live">
+    <h4>Dữ liệu trực tiếp</h4>
+    <div class="live-stat-grid">
+      <div class="live-stat"><div class="live-stat-val" id="sbTds">---</div><div class="live-stat-lbl">TDS ppm</div></div>
+      <div class="live-stat"><div class="live-stat-val" id="sbTurb">---</div><div class="live-stat-lbl">Đục %</div></div>
+    </div>
+    <div class="live-device-row"><span>⚙️ Bơm</span><span class="dev-pill off" id="sbPump">OFF</span></div>
+    <div class="live-device-row"><span>💡 Đèn</span><span class="dev-pill off" id="sbLight">OFF</span></div>
+  </div>
+  <div class="sidebar-status">
+    <h4>Trạng thái hệ thống</h4>
+    <div class="status-row"><span class="s-left"><span>📶</span>ESP32</span><span class="status-val offline" id="statusESP">Chờ mạng...</span></div>
+    <div class="status-row"><span class="s-left"><span>☁️</span>Firebase</span><span class="status-val pending" id="statusFB">Đang kết nối...</span></div>
+    <div class="status-row"><span class="s-left"><span>✈️</span>Telegram</span><span class="status-val linked" id="statusTG">Sẵn sàng</span></div>
+  </div>
+</aside>
+
+<div class="main-wrapper">
+
+  <div class="offline-banner" id="offlineBanner">
+    <span>🔴</span>
+    <span><strong>ESP32 MẤT KẾT NỐI!</strong> — Không nhận dữ liệu mới. Kiểm tra nguồn và WiFi trên mạch.</span>
+    <span id="lastSeenTxt" style="margin-left:auto;font-family:var(--font-mono)"></span>
+  </div>
+  <div class="sensor-banner" id="sensorBanner">
+    <span>⚠️</span>
+    <span><strong>CẢM BIẾN KHÔNG HỢP LỆ!</strong> — ESP32 không nhận tín hiệu từ cảm biến TDS/Turbidity. Kiểm tra dây kết nối GPIO 34, 35.</span>
+  </div>
+
+  <header class="topbar">
+    <div class="topbar-greet">
+      <h1>Xin chào, Admin! 👋</h1>
+      <p id="datetimeText">Đang tải...</p>
+    </div>
+    <div class="topbar-right">
+      <button class="tb-btn" onclick="toggleDark()" title="Dark/Light mode">🌙</button>
+      <button class="tb-btn" onclick="showPanel('alerts',this.parentElement)" title="Cảnh báo">
+        🔔<span class="tb-badge" id="topBadge" style="display:none">0</span>
+      </button>
+      <div class="tb-avatar">A</div>
+    </div>
+  </header>
+
+  <main class="content">
+
+    <!-- ════ TỔNG QUAN ════ -->
+    <div id="panel-overview" class="panel active">
+      <div class="metric-row">
+        <!-- Bơm -->
+        <div class="metric-card" id="mc-pump">
+          <div class="mc-header">
+            <div class="mc-icon blue">⚙️</div>
+            <div><div class="mc-label">Máy bơm lọc</div><div class="mc-value blue" id="pumpVal">Tắt</div></div>
+          </div>
+          <div class="mc-sub" id="pumpMode">Chế độ: Tự động</div>
+          <div class="toggle-wrap">
+            <label class="toggle"><input type="checkbox" id="pumpToggle" onchange="togglePump(this)"><span class="toggle-slider"></span></label>
+            <span class="toggle-label" id="pumpToggleLabel">Tắt</span>
+          </div>
+        </div>
+        <!-- Đèn -->
+        <div class="metric-card">
+          <div class="mc-header">
+            <div class="mc-icon orange">💡</div>
+            <div><div class="mc-label">Đèn bể cá</div><div class="mc-value orange" id="lightVal">Tắt</div></div>
+          </div>
+          <div class="mc-sub" id="lightMode">Chế độ: Lịch</div>
+          <div class="toggle-wrap">
+            <label class="toggle"><input type="checkbox" id="lightToggle" onchange="toggleLight(this)"><span class="toggle-slider orange"></span></label>
+            <span class="toggle-label" id="lightToggleLabel">Tắt</span>
+          </div>
+        </div>
+        <!-- TDS gauge -->
+        <div class="metric-card" id="mc-tds">
+          <div class="mc-label" style="font-weight:700;font-size:11px;color:var(--text-secondary)">Chất rắn hòa tan (TDS)</div>
+          <div class="gauge-flex-container">
+            <div class="circular-progress-ring" id="ring-tds"><div class="gauge-inner-text" id="txt-tds">---<span>ppm</span></div></div>
+            <div style="flex:1">
+              <div class="mc-sub" style="font-weight:700">Ngưỡng: <span id="tdsThShow">350</span> ppm</div>
+              <div class="mc-sub" id="tdsStatus" style="font-size:10px;color:var(--green)">Đang quét...</div>
+            </div>
+          </div>
+        </div>
+        <!-- Turbidity gauge -->
+        <div class="metric-card" id="mc-turb">
+          <div class="mc-label" style="font-weight:700;font-size:11px;color:var(--text-secondary)">Độ đục nguồn nước</div>
+          <div class="gauge-flex-container">
+            <div class="circular-progress-ring" id="ring-turb" style="background:conic-gradient(var(--purple) 0deg,var(--border) 0deg)"><div class="gauge-inner-text" id="txt-turb">---<span>%</span></div></div>
+            <div style="flex:1">
+              <div class="mc-sub" style="font-weight:700">Ngưỡng: <span id="turbThShow">40</span>%</div>
+              <div class="mc-sub" id="turbStatus" style="font-size:10px;color:var(--green)">Đang quét...</div>
+            </div>
+          </div>
+        </div>
+        <!-- Chất lượng nước -->
+        <div class="metric-card">
+          <div class="mc-header"><div class="mc-icon green">🫧</div>
+            <div><div class="mc-label">Chất lượng nước</div><div class="mc-value green" id="waterStatus">Tốt</div></div>
+          </div>
+          <div class="mc-sub">Điểm: <span id="waterPct">85</span>%</div>
+          <div class="progress-bar"><div class="progress-fill" id="waterBar" style="width:85%"></div></div>
+        </div>
+      </div>
+
+      <div class="row3-overview">
+        <!-- Tank -->
+        <div class="tank-card">
+          <div class="tank-header"><span class="tank-title">🐟 BỂ CÁ TRỰC TIẾP</span><span class="live-badge"><span class="live-dot"></span>LIVE</span></div>
+          <div class="tank-body">
+            <div class="fish-scene" id="fishScene"></div>
+            <div class="tank-water-quality">
+              <div class="tank-wq-badge">💧 TDS: <span id="tankTds">---</span> ppm</div>
+              <div class="tank-wq-badge">🌊 Đục: <span id="tankTurb">---</span>%</div>
+            </div>
+            <div class="tank-timestamp">🔄 <span id="tankTime">--:--:--</span></div>
+          </div>
+        </div>
+        <!-- AI Card -->
+        <div class="ai-card">
+          <div class="ai-card-header">
+            <h3><span>🤖</span>AI PHÂN TÍCH</h3>
+            <a href="#" onclick="showPanel('ai',document.querySelectorAll('.nav-item')[2]);return false" style="font-size:11px;color:var(--primary);font-weight:600">Chi tiết →</a>
+          </div>
+          <div>
+            <div class="ai-status-label">Tình trạng tổng quan bể cá</div>
+            <div class="ai-status-big" id="aiStatusBig" style="color:var(--green)">Tốt</div>
+          </div>
+          <div class="ai-robot-row">
+            <div class="ai-robot-icon">🤖</div>
+            <div class="ai-robot-text"><h4>Phân tích AI</h4><p id="aiDesc">Nhập Groq API Key và bấm phân tích.</p></div>
+          </div>
+          <div><div class="ai-suggest-title">💡 Đề xuất từ AI</div>
+            <div class="ai-suggestions" id="aiSuggestions">
+              <div class="ai-suggest-item">Chưa có dữ liệu phân tích</div>
+            </div>
+          </div>
+          <button class="ai-btn" onclick="triggerAI()"><span class="ai-loading" id="aiSpinner"></span>🤖 Phân tích với AI</button>
+        </div>
+        <!-- Stats -->
+        <div class="card">
+          <div class="card-header"><h3>📋 Thống kê</h3></div>
+          <div class="card-body" style="padding:14px">
+            <div class="stats-grid">
+              <div class="stat-box"><div class="stat-box-icon">⏱️</div><div class="stat-box-label">Thời gian hoạt động</div><div class="stat-box-value" id="uptimeVal">0 ngày</div><div class="stat-box-sub" id="uptimeSub">0 giờ</div></div>
+              <div class="stat-box"><div class="stat-box-icon">🔔</div><div class="stat-box-label">Cảnh báo</div><div class="stat-box-value" id="alertCountStat">0</div><div class="stat-box-sub">lần</div></div>
+              <div class="stat-box"><div class="stat-box-icon">🔄</div><div class="stat-box-label">Phiên bản FW</div><div class="stat-box-value" id="statOtaVersion" style="font-size:13px">---</div><div class="stat-box-sub" id="statOtaCount">0 lần cập nhật</div></div>
+              <div class="stat-box"><div class="stat-box-icon">💾</div><div class="stat-box-label">Dữ liệu đã ghi</div><div class="stat-box-value" id="dataCount">0</div><div class="stat-box-sub">bản ghi</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ ĐIỀU KHIỂN ════ -->
+    <div id="panel-control" class="panel">
+      <div class="page-header"><div class="page-header-left"><h2>🎛️ Điều khiển thiết bị</h2><p>Điều khiển bơm và đèn — ghi trực tiếp lên Firebase → ESP32 đọc mỗi 5 giây</p></div></div>
+      <div class="row2">
+        <div class="card">
+          <div class="card-header"><h3>⚙️ Máy Bơm — GPIO 25</h3></div>
+          <div class="card-body">
+            <div class="btn-grp">
+              <button class="btn btn-auto active" id="pumpAutoBtn" onclick="setMode(0)">🔄 Tự Động</button>
+              <button class="btn btn-on"          id="pumpOnBtn"   onclick="setMode(1)">✅ BẬT</button>
+              <button class="btn btn-off"         id="pumpOffBtn"  onclick="setMode(2)">❌ TẮT</button>
+            </div>
+            <div class="mbadge" id="pumpModeBadge">ControlMode = 0</div>
+            <div class="status-bar"><div class="sdot off" id="pumpDot"></div><span class="stxt off" id="pumpText">Đang dừng</span></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h3>💡 Đèn — GPIO 26</h3></div>
+          <div class="card-body">
+            <div class="btn-grp">
+              <button class="btn btn-light-auto active" id="lightAutoBtn" onclick="setLightMode(0)">🌙 Auto</button>
+              <button class="btn btn-light-on"          id="LightOnBtn"   onclick="setLightMode(1)">☀️ BẬT</button>
+              <button class="btn btn-light-off"         id="LightOffBtn"  onclick="setLightMode(2)">🌑 TẮT</button>
+            </div>
+            <div class="mbadge" id="lightModeBadge">LightMode = 0</div>
+            <div class="status-bar"><div class="sdot off" id="lightDot"></div><span class="stxt off" id="lightText">Đang tắt</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="row2">
+        <div class="card">
+          <div class="card-header"><h3>⏰ Lịch Đèn Tự Động</h3></div>
+          <div class="card-body">
+            <div class="field-row"><label>🌅 Bật lúc:</label><input type="number" id="schOn" min="0" max="23" value="7"><span style="font-size:12px;color:var(--text-muted)">giờ</span></div>
+            <div class="field-row"><label>🌙 Tắt lúc:</label><input type="number" id="schOff" min="0" max="23" value="22"><span style="font-size:12px;color:var(--text-muted)">giờ</span></div>
+            <button class="save-btn" onclick="saveSchedule()">💾 Lưu Lịch</button>
+            <div id="schStatus" style="font-size:11px;color:var(--green);margin-top:8px"></div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h3>📐 Ngưỡng Cảnh Báo</h3></div>
+          <div class="card-body">
+            <div class="range-row"><div class="range-label">TDS tối đa <span id="schTdsVal">350 ppm</span></div><input type="range" id="tdsThresh" min="100" max="700" value="350" oninput="updateThresholdSlider()"></div>
+            <div class="range-row"><div class="range-label">Độ đục tối đa <span id="schTurbVal">40 %</span></div><input type="range" id="turbThresh" min="5" max="95" value="40" oninput="updateThresholdSlider()"></div>
+            <button class="save-btn" onclick="saveThresholds()">💾 Lưu Ngưỡng</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ AI ════ -->
+    <div id="panel-ai" class="panel">
+      <div class="page-header"><div class="page-header-left"><h2>🤖 AI Phân tích — Groq Llama 3.3</h2><p>Phân tích dữ liệu bể cá thông minh bằng AI</p></div></div>
+      <div class="card">
+        <div class="card-header"><h3>🧠 Trợ Lý AI Chat</h3><button class="save-btn red" onclick="clearChat()" style="padding:6px 14px;font-size:11px">🗑 Xoá chat</button></div>
+        <div class="card-body">
+          <details style="margin-bottom:16px">
+            <summary style="cursor:pointer;color:var(--text-muted);font-size:12px;padding:8px;background:var(--bg-main);border-radius:var(--radius-sm)">🔑 Cài đặt API Key &amp; Model</summary>
+            <div style="margin-top:12px;padding:14px;background:var(--bg-main);border-radius:var(--radius-md)">
+              <div style="font-size:11px;margin-bottom:6px;color:var(--text-muted)">GROQ API KEY — <a href="https://console.groq.com/keys" target="_blank" style="color:var(--primary)">console.groq.com/keys</a></div>
+              <div style="display:flex;gap:8px;margin-bottom:12px">
+                <input type="password" id="groqKey" placeholder="gsk_..." style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-card);color:var(--text-primary);font-size:12px">
+                <button class="save-btn" onclick="saveGroqKey()" style="padding:8px 14px">Lưu</button>
+              </div>
+              <select id="groqModel" style="width:100%;padding:8px 12px;border-radius:var(--radius-sm);border:1px solid var(--border);background:var(--bg-card);color:var(--text-primary);font-size:12px">
+                <option value="llama-3.3-70b-versatile">Llama 3.3 70B ⭐ (Khuyên dùng)</option>
+                <option value="llama-3.1-8b-instant">Llama 3.1 8B (Nhanh hơn)</option>
+                <option value="mixtral-8x7b-32768">Mixtral 8x7B (Context dài)</option>
+              </select>
+            </div>
+          </details>
+          <div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap">
+            <button class="save-btn" onclick="triggerAI()" style="display:flex;align-items:center;gap:6px"><span class="ai-loading" id="aiSpinner2"></span>⚡ Phân tích nhanh</button>
+            <button onclick="sendQuick('Nước hiện tại có ổn không?')" style="padding:9px 14px;background:var(--bg-main);border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px;cursor:pointer;color:var(--text-secondary)">💧 Nước ổn không?</button>
+            <button onclick="sendQuick('Cá có bị nguy hiểm không?')" style="padding:9px 14px;background:var(--bg-main);border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px;cursor:pointer;color:var(--text-secondary)">🐟 Cá ổn không?</button>
+            <button onclick="sendQuick('Khi nào cần thay nước?')" style="padding:9px 14px;background:var(--bg-main);border:1px solid var(--border);border-radius:var(--radius-md);font-size:12px;cursor:pointer;color:var(--text-secondary)">🔄 Thay nước?</button>
+          </div>
+          <div class="chat-container">
+            <div class="chat-msgs" id="chatMsgs"><div style="align-self:flex-start"><div class="msg-bubble-ai">👋 Xin chào! Tôi là trợ lý AI bể cá. Nhập API Key Groq rồi hỏi tôi bất cứ điều gì nhé!</div></div></div>
+            <div class="chat-input-row">
+              <textarea id="chatInput" placeholder="Hỏi gì đó về bể cá..." rows="1" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendChat()}"></textarea>
+              <button class="chat-send-btn" onclick="sendChat()">➤</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ BIỂU ĐỒ ════ -->
+    <div id="panel-charts" class="panel">
+      <div class="page-header"><div class="page-header-left"><h2>📈 Biểu đồ lịch sử</h2><p>Dữ liệu TDS và độ đục từ Firebase /History</p></div></div>
+      <div class="card">
+        <div class="card-header"><h3>📈 Lịch Sử Firebase</h3></div>
+        <div class="card-body">
+          <div class="row2" style="gap:16px">
+            <div><div style="font-size:12px;font-weight:700;color:var(--teal);margin-bottom:8px">TDS (ppm)</div><div style="height:240px;position:relative"><canvas id="tdsHistChart"></canvas></div></div>
+            <div><div style="font-size:12px;font-weight:700;color:var(--purple);margin-bottom:8px">Độ đục (%)</div><div style="height:240px;position:relative"><canvas id="turbHistChart"></canvas></div></div>
+          </div>
+          <p id="histInfo" style="font-size:11px;color:var(--text-muted);text-align:center;margin-top:12px;font-family:var(--font-mono)">Đang tải dữ liệu...</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ LỊCH SỬ ════ -->
+    <div id="panel-history" class="panel">
+      <div class="page-header"><div class="page-header-left"><h2>🗃️ Bảng lịch sử</h2><p>Toàn bộ bản ghi từ Firebase /History (bao gồm cả offline buffer)</p></div></div>
+      <div class="card">
+        <div class="card-header"><h3>🗃️ Bảng Lịch Sử</h3></div>
+        <div class="card-body" style="overflow-x:auto">
+          <table class="hist-table">
+            <thead><tr><th>Ngày</th><th>Thời gian</th><th>TDS (ppm)</th><th>Đục (%)</th><th>Bơm</th><th>Đèn</th><th>TDS ST</th><th>Đục ST</th><th>Nguồn</th></tr></thead>
+            <tbody id="histTbody"><tr><td colspan="9" style="text-align:center;padding:24px;color:var(--text-muted)">Đang tải...</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ CẢNH BÁO ════ -->
+    <div id="panel-alerts" class="panel">
+      <div class="page-header"><div class="page-header-left"><h2>🔔 Nhật ký cảnh báo</h2><p>Toàn bộ sự kiện hệ thống trong phiên này</p></div></div>
+      <div class="card">
+        <div class="card-header"><h3>🔔 Nhật Ký</h3><button onclick="S.alertLog=[];renderAlerts();hideBadges()" class="save-btn" style="padding:6px 14px;font-size:11px;background:var(--text-muted)">🗑 Xoá tất cả</button></div>
+        <div class="card-body"><div id="alertLogList" style="max-height:450px;overflow-y:auto"><div style="text-align:center;padding:30px;color:var(--text-muted)">Chưa có cảnh báo nào</div></div></div>
+      </div>
+    </div>
+
+    <!-- ════ OTA ════ -->
+    <div id="panel-ota" class="panel">
+      <div class="page-header">
+        <div class="page-header-left"><h2>⬆️ Cập nhật OTA Firmware</h2><p>Nâng cấp firmware ESP32 qua mạng WiFi — không cần USB — cần dùng <strong>beca_ota.ino (v4.0.2)</strong></p></div>
+        <div class="mbadge" id="current-board-version" style="margin-top:0;font-size:13px;padding:6px 16px">Mạch: ---</div>
+      </div>
+      <div class="row2" style="grid-template-columns:1fr 1fr">
+        <div class="card">
+          <div class="card-header"><h3>🚀 Triển khai phiên bản mới</h3><span style="font-size:10px;color:var(--text-muted);font-family:var(--font-mono)">Firebase: /config/otaUrl</span></div>
+          <div class="card-body" style="display:flex;flex-direction:column;gap:14px">
+            <div style="background:var(--primary-bg);border:1px solid rgba(37,99,235,.15);border-radius:var(--radius-md);padding:12px 14px;font-size:12px;color:var(--text-secondary);line-height:1.7">
+              💡 OTA cần firmware <strong>beca_ota.ino (v4.0.2)</strong>. ESP32 sẽ tự tải về và báo tiến trình % lên Firebase realtime.
+            </div>
+            <div class="field-row"><label style="min-width:90px;font-size:11px">🔢 Mã Version</label><input type="text" id="ota-version-input" placeholder="Ví dụ: 4.0.3"></div>
+            <div class="field-row"><label style="min-width:90px;font-size:11px">🔗 Link .bin</label><input type="text" id="ota-url-input" placeholder="https://raw.githubusercontent.com/.../firmware.bin"></div>
+            <div class="field-row"><label style="min-width:90px;font-size:11px">📝 Ghi chú</label><input type="text" id="ota-note-input" placeholder="Mô tả thay đổi..."></div>
+            <button class="save-btn" style="width:100%;padding:12px;background:linear-gradient(135deg,var(--purple),#A855F7);color:white;font-size:13px;border-radius:var(--radius-md)" onclick="triggerOTA()">🚀 Kích Hoạt OTA</button>
+            <div class="ota-steps-container">
+              <div class="ota-step-item" id="step-ota-1"><div class="ota-step-circle">1</div><span>Gửi cấu hình lên Firebase</span></div>
+              <div class="ota-step-item" id="step-ota-2" style="flex-direction:column;align-items:flex-start;gap:4px">
+                <div style="display:flex;width:100%;justify-content:space-between;align-items:center">
+                  <div style="display:flex;align-items:center;gap:10px"><div class="ota-step-circle">2</div><span>ESP32 đang tải file firmware</span></div>
+                  <strong id="ota-progress-text" style="font-family:var(--font-mono);font-size:11px;color:var(--primary)">0%</strong>
+                </div>
+                <div class="ota-progress-wrapper"><div class="ota-progress-fill-bar" id="ota-progress-bar"></div></div>
+              </div>
+              <div class="ota-step-item" id="step-ota-3"><div class="ota-step-circle">3</div><span>Ghi phân vùng Flash &amp; khởi động lại</span></div>
+              <div class="ota-step-item" id="step-ota-4"><div class="ota-step-circle">4</div><span>Thiết bị online với phiên bản mới</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><h3>📊 Thông tin thiết bị</h3></div>
+          <div class="card-body" style="display:flex;flex-direction:column;gap:14px">
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg-main);border-radius:var(--radius-md);font-size:12px">
+                <span style="color:var(--text-secondary)">📦 Phiên bản hiện tại</span><strong id="ota-cur-ver-detail" style="color:var(--primary);font-family:var(--font-mono)">---</strong>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg-main);border-radius:var(--radius-md);font-size:12px">
+                <span style="color:var(--text-secondary)">🔄 Số lần cập nhật</span><strong id="ota-update-count" style="color:var(--purple);font-family:var(--font-mono)">0 lần</strong>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg-main);border-radius:var(--radius-md);font-size:12px">
+                <span style="color:var(--text-secondary)">🕐 Cập nhật gần nhất</span><strong id="ota-last-time" style="color:var(--text-secondary);font-size:11px;font-family:var(--font-mono)">Chưa có</strong>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:10px 14px;background:var(--bg-main);border-radius:var(--radius-md);font-size:12px">
+                <span style="color:var(--text-secondary)">✅ Trạng thái OTA</span><span class="dev-pill on" id="ota-device-status">Sẵn sàng</span>
+              </div>
+            </div>
+            <div style="background:var(--orange-bg);border:1px solid rgba(245,158,11,.2);border-radius:var(--radius-md);padding:12px 14px;font-size:11.5px;color:var(--text-secondary);line-height:1.7">
+              <strong style="color:var(--orange)">⚠️ Lưu ý:</strong><br>
+              • Đảm bảo file .bin đúng cho ESP32<br>• Không rút điện trong lúc cập nhật<br>• Version mới phải khác version hiện tại<br>• Thời gian: 1–3 phút
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════ CÀI ĐẶT ════ -->
+    <div id="panel-settings" class="panel">
+      <div class="page-header"><div class="page-header-left"><h2>⚙️ Cài đặt hệ thống</h2><p>Cấu hình Telegram Bot và AI</p></div></div>
+      <div class="settings-tabs">
+        <button class="stab active" id="stab-notif" onclick="switchStab('notif')">🔕 Thông báo</button>
+        <button class="stab" id="stab-telegram" onclick="switchStab('telegram')">📨 Telegram</button>
+        <button class="stab" id="stab-aiset" onclick="switchStab('aiset')">🤖 AI</button>
+      </div>
+      <div class="spane active" id="spane-notif">
+        <div class="row2">
+          <div class="card">
+            <div class="card-header"><h3>🔕 Quản Lý Thông Báo</h3></div>
+            <div class="card-body">
+              <div class="mute-box">
+                <div class="mute-row">
+                  <div class="mute-icon" id="muteIcon">🔔</div>
+                  <div class="mute-info"><strong id="muteTitle">Thông báo đang BẬT</strong><small id="muteDesc">Khi TDS hoặc độ đục vượt ngưỡng, nhận tin Telegram mỗi 30 giây.</small></div>
+                  <button class="mute-btn-el muting" id="muteBtn" onclick="toggleMute()">🔕 Tắt TB</button>
+                </div>
+                <div class="mute-status-row" id="muteStatusBar"><div class="sdot on"></div><span>Đang nhận cảnh báo bình thường</span></div>
+              </div>
+              <div style="font-size:12px;color:var(--text-muted);line-height:1.9">
+                <strong style="color:var(--text-primary)">Cơ chế:</strong><br>
+                ① Vượt ngưỡng → gửi Telegram ngay<br>② Vẫn vượt → gửi mỗi <strong style="color:var(--primary)">30 giây</strong><br>③ Bấm Tắt → dừng spam<br>④ Nước về an toàn → tự bật lại
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3>📊 Thông tin nhanh</h3></div>
+            <div class="card-body">
+              <div style="display:flex;flex-direction:column;gap:10px">
+                <div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-main);border-radius:var(--radius-md);font-size:13px"><span>🌊 TDS</span><strong id="setTds" style="color:var(--teal)">--- ppm</strong></div>
+                <div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-main);border-radius:var(--radius-md);font-size:13px"><span>💧 Độ đục</span><strong id="setTurb" style="color:var(--purple)">--- %</strong></div>
+                <div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-main);border-radius:var(--radius-md);font-size:13px"><span>⚙️ Bơm</span><strong id="setPump" style="color:var(--green)">---</strong></div>
+                <div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-main);border-radius:var(--radius-md);font-size:13px"><span>💡 Đèn</span><strong id="setLight" style="color:var(--orange)">---</strong></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="spane" id="spane-telegram">
+        <div class="row2">
+          <div class="card">
+            <div class="card-header"><h3>📨 Cài Đặt Telegram Bot</h3></div>
+            <div class="card-body">
+              <div style="font-size:12px;color:var(--text-muted);margin-bottom:16px;padding:10px 14px;background:var(--primary-bg);border-radius:var(--radius-md);border:1px solid rgba(37,99,235,.15)">
+                💡 ESP32 là nguồn gửi Telegram chính. Web chỉ lưu cấu hình và gửi tin test để tránh trùng cảnh báo.
+              </div>
+              <div class="field-row"><label>Bot Token</label><input type="text" id="tgToken" placeholder="8618680216:AAEts..."></div>
+              <div class="field-row"><label>Chat ID</label><input type="text" id="tgChatId" placeholder="7335775840"></div>
+              <div class="field-row" style="margin-top:10px">
+                <label style="min-width:180px">Gửi cảnh báo từ Web</label>
+                <label class="toggle">
+                  <input type="checkbox" id="tgWebAlertsToggle" onchange="toggleWebTgAlerts(this)">
+                  <span class="toggle-slider"></span>
+                </label>
+              </div>
+              <div style="display:flex;gap:10px;margin-top:14px">
+                <button class="save-btn" onclick="saveTelegramConfig()">💾 Lưu &amp; Áp dụng</button>
+                <button class="save-btn green" onclick="testTelegram()">📨 Gửi Test</button>
+              </div>
+              <div id="tgStatus" style="font-size:11px;color:var(--green);margin-top:8px;font-family:var(--font-mono)"></div>
+            </div>
+          </div>
+          <div class="card">
+            <div class="card-header"><h3>📖 Hướng dẫn</h3></div>
+            <div class="card-body">
+              <div style="display:flex;flex-direction:column;gap:12px">
+                <div style="display:flex;gap:10px;align-items:flex-start"><div style="width:24px;height:24px;background:var(--primary);color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0">1</div><div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6">Mở Telegram → Tìm <strong style="color:var(--primary)">@BotFather</strong> → Gửi <code style="background:var(--bg-main);padding:1px 6px;border-radius:4px">/newbot</code> → Copy token</div></div>
+                <div style="display:flex;gap:10px;align-items:flex-start"><div style="width:24px;height:24px;background:var(--primary);color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0">2</div><div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6">Tìm <strong style="color:var(--primary)">@userinfobot</strong> → Nhắn bất kỳ → Copy ID</div></div>
+                <div style="display:flex;gap:10px;align-items:flex-start"><div style="width:24px;height:24px;background:var(--primary);color:#fff;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex-shrink:0">3</div><div style="font-size:12.5px;color:var(--text-secondary);line-height:1.6">Dán token và ID vào ô trái → Nhấn Gửi Test</div></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="spane" id="spane-aiset">
+        <div class="card">
+          <div class="card-header"><h3>🤖 Cài đặt AI — Groq API</h3></div>
+          <div class="card-body">
+            <div style="padding:14px;background:var(--purple-bg);border:1px solid rgba(124,58,237,.15);border-radius:var(--radius-md);margin-bottom:16px;font-size:12px;color:var(--text-secondary);line-height:1.7">
+              🧠 AI sử dụng <strong style="color:var(--purple)">Groq API</strong> với Llama 3.3 70B. Miễn phí tại <a href="https://console.groq.com/keys" target="_blank" style="color:var(--purple)">console.groq.com/keys</a>
+            </div>
+            <div class="field-row">
+              <label>API Key</label>
+              <input type="password" id="groqKey2" placeholder="gsk_..." style="flex:1;padding:8px 12px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--bg-main);color:var(--text-primary);font-size:12px">
+              <button class="save-btn" onclick="saveGroqKey2()" style="padding:8px 14px">Lưu</button>
+            </div>
+            <div id="groqKeyStatus" style="font-size:11px;color:var(--green);margin-bottom:12px"></div>
+            <select id="groqModel2" style="width:100%;padding:10px 12px;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--bg-main);color:var(--text-primary);font-size:12px">
+              <option value="llama-3.3-70b-versatile">Llama 3.3 70B ⭐</option>
+              <option value="llama-3.1-8b-instant">Llama 3.1 8B (Nhanh)</option>
+              <option value="mixtral-8x7b-32768">Mixtral 8x7B</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<script>
+/* ═══════════════════════════════════════════
+   GLOBAL STATE — TDS/Turbidity dùng PascalCase
+   khớp với key Firebase từ ESP32
+═══════════════════════════════════════════ */
+const S = {
+  TDS: null, Turbidity: null,           // ← Đúng PascalCase, khớp ESP32
+  PumpStatus: false, LightStatus: false,
+  ControlMode: 0, LightMode: 0,
+  tdsTh: 350, turbTh: 40,
+  onHour: 7, offHour: 22,
+  notifMuted: false,
+  sensorOk: true, espOffline: false,
+  espLastTs: null, espLastReceiveMs: null,
+  alertLog: [], recordCount: 0,
+  histEntries: [],
+  startTime: Date.now(),
+  otaUpdateCount: 0
+};
+
+const ESP_OFFLINE_THRESHOLD = 15000; // 15s
+let   espOfflineDetected = false;
+let   tdsHistChart, turbHistChart;
+let   groqApiKey = localStorage.getItem("beca_groq_key") || "";
+let   tgToken  = localStorage.getItem("beca_tg_token") || "";
+let   tgChatId = localStorage.getItem("beca_tg_chatid") || "";
+let   webTelegramAlerts = localStorage.getItem("beca_web_tg_alerts") === "true";
+const TG_COOLDOWN = 30000;
+let   lastTG = { TDS:0, Turb:0 };
+let   tgAlertActive = { TDS:false, Turb:false };
+let   warnTDS = false, warnTurb = false;
+
+/* ── Nhận timestamp từ Firebase module ── */
+window._onTimestamp = (ts) => {
+  S.espLastTs = ts;
+  S.espLastReceiveMs = Date.now();
+  if (espOfflineDetected) {
+    espOfflineDetected = false;
+    document.getElementById("statusESP").textContent = "Online";
+    document.getElementById("statusESP").className   = "status-val online";
+    document.getElementById("offlineBanner").classList.remove("show");
+    addAlert("✅ ESP32 đã kết nối lại!", "info");
+    if (webTelegramAlerts) {
+      sendTelegram("✅ <b>ESP32 đã kết nối lại!</b>\n🕐 " + new Date().toLocaleTimeString("vi-VN"));
+    }
+  }
+  document.getElementById("tankTime").textContent = new Date(ts * 1000).toLocaleTimeString("vi-VN");
+  S.recordCount++;
+};
+
+/* ── Watchdog: phát hiện ESP32 offline ── */
+setInterval(() => {
+  if (!S.espLastReceiveMs) return;
+  const elapsed = Date.now() - S.espLastReceiveMs;
+  if (elapsed > ESP_OFFLINE_THRESHOLD && !espOfflineDetected) {
+    espOfflineDetected = true;
+    const lastStr = S.espLastTs ? new Date(S.espLastTs * 1000).toLocaleTimeString("vi-VN") : "--:--";
+    document.getElementById("lastSeenTxt").textContent = "Lần cuối: " + lastStr;
+    document.getElementById("offlineBanner").classList.add("show");
+    document.getElementById("statusESP").textContent = "Offline";
+    document.getElementById("statusESP").className   = "status-val offline";
+    addAlert("🔴 ESP32 mất kết nối! Lần cuối: " + lastStr, "error");
+    if (!S.notifMuted && webTelegramAlerts) {
+      sendTelegram("🔴 <b>ESP32 MẤT KẾT NỐI!</b>\n⏰ Lần cuối nhận: " + lastStr + "\n⚠️ Kiểm tra nguồn điện và WiFi!");
+    }
+  } else if (elapsed <= ESP_OFFLINE_THRESHOLD && S.espLastReceiveMs) {
+    document.getElementById("statusESP").textContent = "Online";
+    document.getElementById("statusESP").className   = "status-val online";
+  }
+}, 3000);
+
+/* ════════════════════════════════════════════
+   GAUGE TRÒN — conic-gradient động
+════════════════════════════════════════════ */
+function updateProgressRing(ringId, textId, value, max, unit) {
+  const ring = document.getElementById(ringId);
+  const txt  = document.getElementById(textId);
+  if (!ring || !txt) return;
+  if (value === null) {
+    txt.innerHTML = `---<span>${unit}</span>`;
+    ring.style.background = "conic-gradient(#E2E8F0 360deg,#E2E8F0 0deg)";
+    return;
+  }
+  const pct   = Math.min(100, Math.max(0, (value / max) * 100));
+  let color   = "var(--teal)";
+  if (ringId === "ring-tds")  color = (value > S.tdsTh)  ? "var(--red)"    : "var(--teal)";
+  if (ringId === "ring-turb") color = (value > S.turbTh) ? "var(--orange)" : "var(--purple)";
+  txt.innerHTML  = `${Math.round(value)}<span>${unit}</span>`;
+  ring.style.background = `conic-gradient(${color} ${pct * 3.6}deg,var(--border) 0deg)`;
+}
+
+/* ════════════════════════════════════════════
+   RENDER CHÍNH — gọi mỗi khi Firebase cập nhật
+════════════════════════════════════════════ */
+function render() {
+  const tds  = S.TDS       !== null ? S.TDS       : null;
+  const turb = S.Turbidity !== null ? S.Turbidity : null;
+
+  /* ── Banner cảm biến ── */
+  document.getElementById("sensorBanner").classList.toggle("show", !S.sensorOk);
+
+  /* ── Sidebar live ── */
+  document.getElementById("sbTds").textContent   = tds  !== null && S.sensorOk ? Math.round(tds)  : "---";
+  document.getElementById("sbTurb").textContent  = turb !== null && S.sensorOk ? Math.round(turb) : "---";
+  document.getElementById("sbPump").textContent  = S.PumpStatus  ? "ON" : "OFF";
+  document.getElementById("sbPump").className    = "dev-pill " + (S.PumpStatus  ? "on" : "off");
+  document.getElementById("sbLight").textContent = S.LightStatus ? "ON" : "OFF";
+  document.getElementById("sbLight").className   = "dev-pill " + (S.LightStatus ? "on" : "off");
+
+  /* ── Gauge TDS ── */
+  updateProgressRing("ring-tds",  "txt-tds",  S.sensorOk ? tds  : null, 700,  "ppm");
+  updateProgressRing("ring-turb", "txt-turb", S.sensorOk ? turb : null, 100,  "%");
+
+  /* ── Ngưỡng hiển thị ── */
+  document.getElementById("tdsThShow").textContent  = S.tdsTh;
+  document.getElementById("turbThShow").textContent = S.turbTh;
+
+  /* ── Tank overlay ── */
+  if (tds  !== null && S.sensorOk) document.getElementById("tankTds").textContent  = Math.round(tds);
+  if (turb !== null && S.sensorOk) document.getElementById("tankTurb").textContent = Math.round(turb);
+
+  /* ── TDS status + cảnh báo metric card ── */
+  const mcTds  = document.getElementById("mc-tds");
+  const mcTurb = document.getElementById("mc-turb");
+  if (tds !== null && S.sensorOk) {
+    const over = tds > S.tdsTh;
+    document.getElementById("tdsStatus").textContent = over ? "⚠️ Vượt ngưỡng!" : "✓ Bình thường";
+    document.getElementById("tdsStatus").style.color = over ? "var(--red)" : "var(--green)";
+    mcTds.classList.toggle("alert-card", over);
+    if (over && !warnTDS) { addAlert(`🚨 TDS vượt ngưỡng: ${Math.round(tds)} ppm`, "error"); warnTDS = true; }
+    else if (!over && warnTDS) { addAlert("✅ TDS bình thường: " + Math.round(tds) + " ppm", "info"); warnTDS = false; }
+  } else if (!S.sensorOk) {
+    document.getElementById("tdsStatus").textContent = "Cảm biến không kết nối";
+    document.getElementById("tdsStatus").style.color = "var(--text-muted)";
+    mcTds.classList.remove("alert-card");
+  }
+  if (turb !== null && S.sensorOk) {
+    const over = turb > S.turbTh;
+    document.getElementById("turbStatus").textContent = over ? "⚠️ Độ đục cao!" : "✓ Bình thường";
+    document.getElementById("turbStatus").style.color = over ? "var(--orange)" : "var(--green)";
+    mcTurb.classList.toggle("alert-card", over);
+    if (over && !warnTurb) { addAlert(`🚨 Độ đục vượt ngưỡng: ${Math.round(turb)}%`, "error"); warnTurb = true; }
+    else if (!over && warnTurb) { addAlert("✅ Độ đục bình thường: " + Math.round(turb) + "%", "info"); warnTurb = false; }
+  } else if (!S.sensorOk) {
+    document.getElementById("turbStatus").textContent = "Cảm biến không kết nối";
+    document.getElementById("turbStatus").style.color = "var(--text-muted)";
+    mcTurb.classList.remove("alert-card");
+  }
+
+  /* ── Chất lượng nước tổng hợp ── */
+  let pct = 85;
+  if (tds !== null && turb !== null && S.sensorOk) {
+    pct = Math.max(0, Math.min(100, Math.round(100 - (tds/S.tdsTh)*30 - (turb/S.turbTh)*50)));
+  }
+  document.getElementById("waterPct").textContent  = pct;
+  document.getElementById("waterBar").style.width  = pct + "%";
+  const wt = pct > 70 ? "Tốt" : pct > 40 ? "Trung bình" : "Kém";
+  const wc = pct > 70 ? "var(--green)" : pct > 40 ? "var(--orange)" : "var(--red)";
+  document.getElementById("waterStatus").textContent = wt;
+  document.getElementById("waterStatus").style.color  = wc;
+
+  /* ── Bơm UI ── */
+  if (!window.lockPumpClick) {
+    document.getElementById("pumpVal").textContent          = S.PumpStatus ? "Bật" : "Tắt";
+    document.getElementById("pumpToggle").checked           = S.PumpStatus;
+    document.getElementById("pumpToggleLabel").textContent  = S.PumpStatus ? "Bật" : "Tắt";
+    document.getElementById("pumpDot").className            = "sdot " + (S.PumpStatus ? "on" : "off");
+    document.getElementById("pumpText").className           = "stxt " + (S.PumpStatus ? "on" : "off");
+    document.getElementById("pumpText").textContent         = S.PumpStatus ? "Bơm đang chạy" : "Bơm đang dừng";
+    document.getElementById("pumpAutoBtn").classList.toggle("active", S.ControlMode === 0);
+    document.getElementById("pumpOnBtn").classList.toggle("active",   S.ControlMode === 1);
+    document.getElementById("pumpOffBtn").classList.toggle("active",  S.ControlMode === 2);
+  }
+  document.getElementById("pumpMode").textContent       = "Chế độ: " + (S.ControlMode===0?"Tự động":S.ControlMode===1?"Bật thủ công":"Tắt thủ công");
+  document.getElementById("pumpModeBadge").textContent  = "ControlMode = " + S.ControlMode;
+
+  /* ── Đèn UI ── */
+  if (!window.lockLightClick) {
+    document.getElementById("lightVal").textContent          = S.LightStatus ? "Bật" : "Tắt";
+    document.getElementById("lightToggle").checked           = S.LightStatus;
+    document.getElementById("lightToggleLabel").textContent  = S.LightStatus ? "Bật" : "Tắt";
+    document.getElementById("lightDot").className            = "sdot " + (S.LightStatus ? "on" : "off");
+    document.getElementById("lightText").className           = "stxt " + (S.LightStatus ? "on" : "off");
+    document.getElementById("lightText").textContent         = S.LightStatus ? "Đèn đang sáng" : "Đèn đang tắt";
+    document.getElementById("lightAutoBtn").classList.toggle("active", S.LightMode === 0);
+    document.getElementById("LightOnBtn").classList.toggle("active",   S.LightMode === 1);
+    document.getElementById("LightOffBtn").classList.toggle("active",  S.LightMode === 2);
+  }
+  document.getElementById("lightMode").textContent       = "Chế độ: " + (S.LightMode===0?"Lịch":S.LightMode===1?"Bật":"Tắt");
+  document.getElementById("lightModeBadge").textContent  = "LightMode = " + S.LightMode;
+
+  /* ── Settings quick info ── */
+  const tEl = document.getElementById("setTds");
+  const uEl = document.getElementById("setTurb");
+  const pEl = document.getElementById("setPump");
+  const lEl = document.getElementById("setLight");
+  if (tEl) tEl.textContent = tds  !== null && S.sensorOk ? Math.round(tds)  + " ppm" : "--- ppm";
+  if (uEl) uEl.textContent = turb !== null && S.sensorOk ? Math.round(turb) + " %"   : "--- %";
+  if (pEl) { pEl.textContent = S.PumpStatus  ? "BẬT" : "TẮT"; pEl.style.color = S.PumpStatus  ? "var(--green)"  : "var(--red)"; }
+  if (lEl) { lEl.textContent = S.LightStatus ? "BẬT" : "TẮT"; lEl.style.color = S.LightStatus ? "var(--orange)" : "var(--text-muted)"; }
+
+  /* ── Stats ── */
+  const ms = Date.now() - S.startTime;
+  document.getElementById("uptimeVal").textContent      = Math.floor(ms/86400000) + " ngày";
+  document.getElementById("uptimeSub").textContent      = Math.floor((ms%86400000)/3600000) + " giờ";
+  document.getElementById("alertCountStat").textContent = S.alertLog.filter(a => a.type === "error").length;
+  document.getElementById("dataCount").textContent      = S.recordCount.toLocaleString();
+
+  /* ── Telegram alert từ Web ── */
+  if (S.sensorOk) tgCheckAlerts(tds, turb);
+}
+
+/* ════════════════════════════════════════════
+   ĐIỀU KHIỂN — optimistic UI + ghi Firebase
+════════════════════════════════════════════ */
+function setMode(v) {
+  S.ControlMode = v;
+  window.lockPumpClick = true;
+  document.getElementById("pumpAutoBtn").classList.toggle("active", v === 0);
+  document.getElementById("pumpOnBtn").classList.toggle("active",   v === 1);
+  document.getElementById("pumpOffBtn").classList.toggle("active",  v === 2);
+  document.getElementById("pumpModeBadge").textContent = "ControlMode = " + v;
+  if (window._fbReady) window._fbSetMode(v);
+  setTimeout(() => { window.lockPumpClick = false; }, 1500);
+}
+
+function setLightMode(v) {
+  S.LightMode = v;
+  window.lockLightClick = true;
+  document.getElementById("lightAutoBtn").classList.toggle("active", v === 0);
+  document.getElementById("LightOnBtn").classList.toggle("active",   v === 1);
+  document.getElementById("LightOffBtn").classList.toggle("active",  v === 2);
+  document.getElementById("lightModeBadge").textContent = "LightMode = " + v;
+  if (window._fbReady) window._fbSetLight(v);
+  setTimeout(() => { window.lockLightClick = false; }, 1500);
+}
+
+function togglePump(el)  { setMode(el.checked ? 1 : 2); }
+function toggleLight(el) { setLightMode(el.checked ? 1 : 2); }
+
+function saveSchedule() {
+  const on  = +document.getElementById("schOn").value;
+  const off = +document.getElementById("schOff").value;
+  if (on < 0||on > 23||off < 0||off > 23) return;
+  if (window._fbReady) window._fbSetSchedule(on, off);
+  document.getElementById("schStatus").textContent = `✅ Đã lưu: Bật ${on}:00 — Tắt ${off}:00`;
+}
+
+function updateThresholdSlider() {
+  S.tdsTh  = +document.getElementById("tdsThresh").value;
+  S.turbTh = +document.getElementById("turbThresh").value;
+  document.getElementById("schTdsVal").textContent  = S.tdsTh  + " ppm";
+  document.getElementById("schTurbVal").textContent = S.turbTh + " %";
+  document.getElementById("tdsThShow").textContent  = S.tdsTh;
+  document.getElementById("turbThShow").textContent = S.turbTh;
+}
+
+function saveThresholds() {
+  if (window._fbReady) window._fbSetThresh(S.tdsTh, S.turbTh);
+  addAlert("📐 Ngưỡng đã lưu: TDS=" + S.tdsTh + "ppm, Đục=" + S.turbTh + "%", "info");
+  showToast("info", "✅ Đã lưu ngưỡng cảnh báo");
+}
+
+/* ════════════════════════════════════════════
+   OTA
+════════════════════════════════════════════ */
+function triggerOTA() {
+  const targetVer = document.getElementById("ota-version-input").value.trim();
+  const cloudUrl  = document.getElementById("ota-url-input").value.trim();
+  if (!targetVer || !cloudUrl.startsWith("https://")) {
+    showToast("error", "Nhập đầy đủ Version và link HTTPS .bin!");
+    return;
+  }
+  if (!confirm(`Xác nhận OTA lên phiên bản ${targetVer}?`)) return;
+
+  for (let i=1;i<=4;i++) document.getElementById("step-ota-"+i).className = "ota-step-item";
+  document.getElementById("ota-progress-bar").style.width = "0%";
+  document.getElementById("ota-progress-text").textContent = "0%";
+
+  if (window._fbReady) {
+    const note = document.getElementById("ota-note-input").value.trim();
+    window._fbOtaTrigger(targetVer, cloudUrl, note);
+    window._fbOtaCountUp();
+    const nowStr = new Date().toLocaleString("vi-VN");
+    document.getElementById("ota-last-time").textContent = nowStr;
+    document.getElementById("step-ota-1").className = "ota-step-item success";
+    document.getElementById("step-ota-2").className = "ota-step-item active";
+    addAlert("🚀 OTA kích hoạt: phiên bản " + targetVer, "info");
+    showToast("info", "✅ Đã gửi lệnh OTA lên Firebase. ESP32 đang xử lý...");
+  } else {
+    showToast("error", "Firebase chưa kết nối!");
+  }
+}
+
+function updateOtaProgressUI(status, progress) {
+  const pBar = document.getElementById("ota-progress-bar");
+  const pTxt = document.getElementById("ota-progress-text");
+  if (!pBar||!pTxt) return;
+  if (status === 2) {
+    document.getElementById("step-ota-1").className = "ota-step-item success";
+    document.getElementById("step-ota-2").className = "ota-step-item active";
+    pBar.style.width = progress + "%";
+    pTxt.textContent = progress + "%";
+    if (progress >= 100) document.getElementById("step-ota-3").className = "ota-step-item active";
+  } else if (status === 3) {
+    ["step-ota-1","step-ota-2","step-ota-3","step-ota-4"].forEach(id => document.getElementById(id).className = "ota-step-item success");
+    pBar.style.width = "100%"; pTxt.textContent = "100%";
+    const st = document.getElementById("ota-device-status");
+    if (st) { st.textContent = "✅ Thành công"; st.className = "dev-pill on"; }
+    showToast("info", "🎉 OTA thành công! Mạch đang khởi động lại...");
+  } else if (status === -1) {
+    document.getElementById("step-ota-2").className = "ota-step-item failure";
+    pBar.style.background = "var(--red)"; pTxt.textContent = "Lỗi!";
+    const st = document.getElementById("ota-device-status");
+    if (st) { st.textContent = "❌ Lỗi OTA"; st.className = "dev-pill off"; }
+    showToast("error", "❌ OTA thất bại! Kiểm tra file .bin và kết nối.");
+  }
+}
+
+/* ════════════════════════════════════════════
+   CHARTS
+════════════════════════════════════════════ */
+function initCharts() {
+  const common = {responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#94A3B8",maxTicksLimit:6,maxRotation:45,font:{size:9}}},y:{ticks:{color:"#94A3B8"},grid:{color:"rgba(0,0,0,.05)"}}}};
+  tdsHistChart = new Chart(document.getElementById("tdsHistChart"), {
+    type:"line", data:{labels:[],datasets:[{label:"TDS",data:[],borderColor:"#0EA5E9",backgroundColor:"rgba(14,165,233,.1)",fill:true,tension:.3,pointRadius:2,borderWidth:2}]},
+    options:{...common, scales:{...common.scales, y:{...common.scales.y, title:{display:true,text:"ppm"}}}}
+  });
+  turbHistChart = new Chart(document.getElementById("turbHistChart"), {
+    type:"line", data:{labels:[],datasets:[{label:"Đục",data:[],borderColor:"#7C3AED",backgroundColor:"rgba(124,58,237,.1)",fill:true,tension:.3,pointRadius:2,borderWidth:2}]},
+    options:{...common, scales:{...common.scales, y:{...common.scales.y,min:0,max:100,title:{display:true,text:"%"}}}}
+  });
+}
+
+function updateHistCharts() {
+  if (!tdsHistChart||!turbHistChart) return;
+  const labels = S.histEntries.map(e => e.t || new Date((e.ts||0)*1000).toLocaleTimeString("vi-VN"));
+  tdsHistChart.data.labels                   = labels;
+  tdsHistChart.data.datasets[0].data         = S.histEntries.map(e => Math.round(+(e.tds||0)));
+  turbHistChart.data.labels                  = labels;
+  turbHistChart.data.datasets[0].data        = S.histEntries.map(e => Math.round(+(e.turb||0)));
+  tdsHistChart.update("none");
+  turbHistChart.update("none");
+  document.getElementById("histInfo").textContent = S.histEntries.length + " điểm dữ liệu";
+}
+
+function updateHistTable() {
+  const tbody = document.getElementById("histTbody");
+  if (!S.histEntries.length) { tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:24px;color:var(--text-muted)">Chưa có dữ liệu</td></tr>'; return; }
+  tbody.innerHTML = [...S.histEntries].reverse().slice(0,50).map(e => {
+    const tds  = Math.round(+(e.tds||0));
+    const turb = Math.round(+(e.turb||0));
+    const tsDate = new Date((e.ts||0)*1000);
+    const time = e.t || tsDate.toLocaleTimeString("vi-VN");
+    const date = e.ts ? tsDate.toLocaleDateString("vi-VN",{day:"2-digit",month:"2-digit",year:"numeric"}) : "--/--/----";
+    const src  = e.offline ? '<span class="badge-offline">📴 Offline</span>' : '<span class="badge-ok">🟢 Live</span>';
+    return `<tr>
+      <td style="font-size:10.5px;color:var(--text-muted)">${date}</td><td>${time}</td>
+      <td style="color:var(--teal);font-weight:700">${tds}</td>
+      <td style="color:var(--purple);font-weight:700">${turb}</td>
+      <td><span class="${e.pump?'badge-on':'badge-off'}">${e.pump?'ON':'OFF'}</span></td>
+      <td><span class="${e.light?'badge-on':'badge-off'}">${e.light?'ON':'OFF'}</span></td>
+      <td>${tds>S.tdsTh?'<span class="badge-warn">Cao</span>':'<span class="badge-ok">OK</span>'}</td>
+      <td>${turb>S.turbTh?'<span class="badge-warn">Cao</span>':'<span class="badge-ok">OK</span>'}</td>
+      <td>${src}</td>
+    </tr>`;
+  }).join("");
+}
+
+/* ════════════════════════════════════════════
+   THÔNG BÁO / MUTE
+════════════════════════════════════════════ */
+function toggleMute() {
+  S.notifMuted = !S.notifMuted;
+  if (window._fbReady) window._fbSetNotifMute(S.notifMuted);
+  updateMuteUI();
+}
+
+function updateMuteUI() {
+  const m = S.notifMuted;
+  document.getElementById("muteIcon").textContent  = m ? "🔕" : "🔔";
+  document.getElementById("muteTitle").textContent = m ? "Thông báo đang TẮT" : "Thông báo đang BẬT";
+  document.getElementById("muteDesc").textContent  = m ? "Đã tạm dừng. Tự bật lại khi nước về an toàn." : "Nhận cảnh báo khi TDS hoặc độ đục vượt ngưỡng.";
+  const btn = document.getElementById("muteBtn");
+  btn.textContent = m ? "🔔 Bật lại" : "🔕 Tắt TB";
+  btn.className   = m ? "mute-btn-el unmuting" : "mute-btn-el muting";
+  document.getElementById("muteStatusBar").innerHTML = m
+    ? '<div class="sdot off"></div><span style="color:var(--red)">Thông báo đã tạm dừng</span>'
+    : '<div class="sdot on"></div><span>Đang nhận cảnh báo bình thường</span>';
+}
+
+/* ════════════════════════════════════════════
+   ALERTS LOG
+════════════════════════════════════════════ */
+function addAlert(title, type="info") {
+  const time = new Date().toLocaleTimeString("vi-VN");
+  S.alertLog.unshift({ time, title, type });
+  if (S.alertLog.length > 100) S.alertLog.pop();
+  const badgeCount = S.alertLog.filter(a => a.type === "error" || a.type === "warn").length;
+  document.getElementById("alertBadge").textContent     = badgeCount;
+  document.getElementById("alertBadge").style.display   = badgeCount ? "" : "none";
+  document.getElementById("topBadge").textContent       = badgeCount;
+  document.getElementById("topBadge").style.display     = badgeCount ? "" : "none";
+  document.getElementById("alertCountStat").textContent = S.alertLog.filter(a=>a.type==="error").length;
+  renderAlerts();
+  showToast(type, title);
+}
+
+function renderAlerts() {
+  const el = document.getElementById("alertLogList");
+  if (!S.alertLog.length) { el.innerHTML='<div style="text-align:center;padding:30px;color:var(--text-muted)">Chưa có cảnh báo nào</div>'; return; }
+  el.innerHTML = S.alertLog.map(a => `
+    <div class="alert-item">
+      <div class="alert-ico ${a.type}">${a.type==="error"?"🚨":a.type==="warn"?"⚠️":a.type==="info"?"ℹ️":"✅"}</div>
+      <div class="alert-body">
+        <div class="alert-title ${a.type}">${a.title}</div>
+        <div class="alert-time">${a.time}</div>
+      </div>
+    </div>`).join("");
+}
+
+function hideBadges() {
+  document.getElementById("alertBadge").style.display = "none";
+  document.getElementById("topBadge").style.display   = "none";
+}
+
+/* ════════════════════════════════════════════
+   TELEGRAM (ESP32 gửi chính; Web tắt cảnh báo tự động mặc định)
+════════════════════════════════════════════ */
+async function sendTelegram(msg) {
+  if (!tgToken||!tgChatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ chat_id:tgChatId, text:msg, parse_mode:"HTML" })
+    });
+  } catch(e) { console.warn("[TG]", e); }
+}
+
+function tgCheckAlerts(tds, turb) {
+  if (S.notifMuted || !webTelegramAlerts) return;
+  const now  = Date.now();
+  const time = new Date().toLocaleTimeString("vi-VN");
+  if (tds !== null && tds > S.tdsTh) {
+    if (!tgAlertActive.TDS || now - lastTG.TDS > TG_COOLDOWN) {
+      sendTelegram(`🚨 <b>CẢNH BÁO TDS (WEB)!</b>\n📊 ${Math.round(tds)} ppm (ngưỡng ${S.tdsTh})\n🕐 ${time}`);
+      lastTG.TDS = now; tgAlertActive.TDS = true;
+    }
+  } else if (tds !== null && tgAlertActive.TDS) {
+    sendTelegram(`✅ TDS bình thường: ${Math.round(tds)} ppm\n🕐 ${time}`);
+    tgAlertActive.TDS = false;
+  }
+  if (turb !== null && turb > S.turbTh) {
+    if (!tgAlertActive.Turb || now - lastTG.Turb > TG_COOLDOWN) {
+      sendTelegram(`🚨 <b>CẢNH BÁO ĐỘ ĐỤC (WEB)!</b>\n💧 ${Math.round(turb)}% (ngưỡng ${S.turbTh})\n🕐 ${time}`);
+      lastTG.Turb = now; tgAlertActive.Turb = true;
+    }
+  } else if (turb !== null && tgAlertActive.Turb) {
+    sendTelegram(`✅ Độ đục bình thường: ${Math.round(turb)}%\n🕐 ${time}`);
+    tgAlertActive.Turb = false;
+  }
+}
+
+function saveTelegramConfig() {
+  tgToken  = document.getElementById("tgToken").value.trim();
+  tgChatId = document.getElementById("tgChatId").value.trim();
+  localStorage.setItem("beca_tg_token", tgToken);
+  localStorage.setItem("beca_tg_chatid", tgChatId);
+  document.getElementById("tgStatus").textContent = "✅ Đã lưu cấu hình Telegram!";
+}
+
+function toggleWebTgAlerts(el) {
+  webTelegramAlerts = el.checked;
+  localStorage.setItem("beca_web_tg_alerts", webTelegramAlerts ? "true" : "false");
+  showToast("info", webTelegramAlerts ? "✅ Đã bật cảnh báo từ Web" : "🔕 Đã tắt cảnh báo từ Web");
+}
+
+function testTelegram() {
+  const el = document.getElementById("tgStatus");
+  tgToken  = document.getElementById("tgToken").value.trim();
+  tgChatId = document.getElementById("tgChatId").value.trim();
+  if (!tgToken || !tgChatId) {
+    el.textContent = "⚠️ Nhập Token và Chat ID trước khi gửi test.";
+    el.style.color = "var(--orange)";
+    return;
+  }
+  el.textContent = "⏳ Đang gửi...";
+  fetch(`https://api.telegram.org/bot${tgToken}/sendMessage`, {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({chat_id:tgChatId, text:`✅ <b>Kết nối thành công!</b>\n🌐 Bể Cá IoT v4.5 hoạt động.\n🕐 ${new Date().toLocaleTimeString("vi-VN")}`, parse_mode:"HTML"})
+  }).then(r=>r.json()).then(r=>{
+    el.textContent = r.ok ? "✅ Gửi thành công!" : "❌ Lỗi: " + (r.description||"sai Token?");
+    el.style.color = r.ok ? "var(--green)" : "var(--red)";
+  }).catch(()=>{ el.textContent="❌ Không kết nối."; el.style.color="var(--red)"; });
+}
+
+/* ════════════════════════════════════════════
+   AI CHAT (Groq)
+════════════════════════════════════════════ */
+function saveGroqKey()  { 
+  groqApiKey = document.getElementById("groqKey").value.trim();  
+  localStorage.setItem("beca_groq_key", groqApiKey);
+  showToast("info","✅ Đã lưu Groq API Key"); 
+  const k2=document.getElementById("groqKey2"); 
+  if(k2) k2.value=groqApiKey; 
+}
+function saveGroqKey2() { 
+  groqApiKey = document.getElementById("groqKey2").value.trim(); 
+  localStorage.setItem("beca_groq_key", groqApiKey);
+  document.getElementById("groqKeyStatus").textContent="✅ Đã lưu!"; 
+  const k1=document.getElementById("groqKey"); 
+  if(k1) k1.value=groqApiKey; 
+}
+
+function getAIContext() {
+  const tds  = S.TDS !== null && S.sensorOk       ? Math.round(S.TDS)       : "N/A";
+  const turb = S.Turbidity !== null && S.sensorOk  ? Math.round(S.Turbidity) : "N/A";
+  let histTxt = "Chưa có.";
+  if (S.histEntries.length > 0) {
+    histTxt = S.histEntries.slice(-20).map(e => `${e.t||"?"}:TDS=${Math.round(+(e.tds||0))}ppm,Đục=${Math.round(+(e.turb||0))}%`).join(" | ");
+  }
+  return `Bạn là trợ lý AI bể cá IoT. Trả lời ngắn, thân thiện, dùng emoji, bằng tiếng Việt.
+DỮ LIỆU (${new Date().toLocaleTimeString("vi-VN")}): TDS=${tds}ppm(ngưỡng${S.tdsTh}), Độ đục=${turb}%(ngưỡng${S.turbTh}), Bơm=${S.PumpStatus?"CHẠY":"TẮT"}, Đèn=${S.LightStatus?"BẬT":"TẮT"}, ESP32=${espOfflineDetected?"Offline":"Online"}, Cảm biến=${S.sensorOk?"OK":"Không kết nối"}
+Lịch sử: ${histTxt}`;
+}
+
+async function triggerAI() {
+  if (!groqApiKey) { showToast("warn","Nhập API Key Groq trước!"); return; }
+  ["aiSpinner","aiSpinner2"].forEach(id => { const el=document.getElementById(id); if(el) el.style.display="inline-block"; });
+  const prompt = `Phân tích dữ liệu bể cá: TDS=${S.TDS !== null&&S.sensorOk?Math.round(S.TDS):"N/A"}ppm(ngưỡng${S.tdsTh}), độ đục=${S.Turbidity !== null&&S.sensorOk?Math.round(S.Turbidity):"N/A"}%(ngưỡng${S.turbTh}), bơm=${S.PumpStatus?"bật":"tắt"}, đèn=${S.LightStatus?"bật":"tắt"}. Trả lời JSON: {"status":"Tốt/Trung bình/Cần chú ý","desc":"mô tả ngắn","suggestions":["gợi ý 1","gợi ý 2","gợi ý 3"]}`;
+  try {
+    const model = document.getElementById("groqModel")?.value || "llama-3.3-70b-versatile";
+    const res   = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method:"POST", headers:{"Authorization":`Bearer ${groqApiKey}`,"Content-Type":"application/json"},
+      body: JSON.stringify({model, messages:[{role:"user",content:prompt}], temperature:.4, max_tokens:400})
+    });
+    const json  = await res.json();
+    const raw   = json.choices?.[0]?.message?.content || "{}";
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    const data  = JSON.parse(jsonMatch ? jsonMatch[0] : raw);
+    const sc    = data.status==="Tốt"?"var(--green)":data.status==="Trung bình"?"var(--orange)":"var(--red)";
+    document.getElementById("aiStatusBig").textContent = data.status || "Tốt";
+    document.getElementById("aiStatusBig").style.color = sc;
+    document.getElementById("aiDesc").textContent      = data.desc  || "Phân tích hoàn tất";
+    const sug = data.suggestions || ["Duy trì chế độ hiện tại"];
+    document.getElementById("aiSuggestions").innerHTML = sug.map(s=>`<div class="ai-suggest-item">${s}</div>`).join("");
+  } catch(e) { showToast("error","AI lỗi: " + e.message); }
+  ["aiSpinner","aiSpinner2"].forEach(id => { const el=document.getElementById(id); if(el) el.style.display="none"; });
+}
+
+async function sendChat() {
+  const inp = document.getElementById("chatInput");
+  const msg = inp.value.trim(); if (!msg) return;
+  if (!groqApiKey) { showToast("warn","Nhập API Key Groq trước!"); return; }
+  inp.value = "";
+  appendChatMsg("user", msg);
+  const model = document.getElementById("groqModel")?.value || "llama-3.3-70b-versatile";
+  try {
+    const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method:"POST", headers:{"Authorization":`Bearer ${groqApiKey}`,"Content-Type":"application/json"},
+      body: JSON.stringify({model, messages:[{role:"system",content:getAIContext()},{role:"user",content:msg}], temperature:.7, max_tokens:500})
+    });
+    const json  = await res.json();
+    appendChatMsg("ai", json.choices?.[0]?.message?.content || "Không có phản hồi");
+  } catch(e) { appendChatMsg("ai","❌ Lỗi: " + e.message); }
+}
+
+function appendChatMsg(role, text) {
+  const div = document.createElement("div");
+  div.style.cssText = `display:flex;justify-content:${role==="user"?"flex-end":"flex-start"}`;
+  const b = document.createElement("div");
+  b.className = role==="user"?"msg-bubble-user":"msg-bubble-ai";
+  b.textContent = text; div.appendChild(b);
+  const c = document.getElementById("chatMsgs"); c.appendChild(div); c.scrollTop = c.scrollHeight;
+}
+
+function sendQuick(msg) { document.getElementById("chatInput").value = msg; sendChat(); }
+function clearChat() { document.getElementById("chatMsgs").innerHTML = '<div style="align-self:flex-start"><div class="msg-bubble-ai">🔄 Chat đã xoá. Hỏi tôi điều gì mới nhé!</div></div>'; }
+
+/* ════════════════════════════════════════════
+   TOAST
+════════════════════════════════════════════ */
+function showToast(type, msg) {
+  const c = document.getElementById("toastContainer");
+  const t = document.createElement("div");
+  t.className = "toast " + type;
+  t.innerHTML = `<span>${type==="error"?"🚨":type==="warn"?"⚠️":"ℹ️"}</span><span style="flex:1">${msg}</span>`;
+  c.appendChild(t);
+  setTimeout(() => { t.style.opacity="0"; setTimeout(()=>t.remove(),300); }, 3500);
+}
+
+/* ════════════════════════════════════════════
+   PANEL NAVIGATION
+════════════════════════════════════════════ */
+function showPanel(name, el) {
+  document.querySelectorAll(".panel").forEach(p => p.classList.remove("active"));
+  document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("active"));
+  const target = document.getElementById("panel-"+name);
+  if (target) target.classList.add("active");
+  if (el) el.classList.add("active");
+  if (name === "alerts") hideBadges();
+}
+
+function switchStab(tab) {
+  ["notif","telegram","aiset"].forEach(t => {
+    document.getElementById("stab-"+t).classList.toggle("active", t===tab);
+    document.getElementById("spane-"+t).classList.toggle("active", t===tab);
+  });
+}
+
+function toggleDark() { 
+  const isDark = document.body.classList.toggle("dark"); 
+  localStorage.setItem("beca_dark_mode", isDark ? "true" : "false");
+}
+
+/* ════════════════════════════════════════════
+   FISH SCENE
+════════════════════════════════════════════ */
+function buildFishScene() {
+  const scene = document.getElementById("fishScene");
+  if (!scene) return;
+  scene.innerHTML = "";
+  const sand = document.createElement("div");
+  sand.style.cssText = "position:absolute;bottom:0;left:0;right:0;height:48px;background:linear-gradient(to top,#78350f,#b45309);border-radius:60% 60% 0 0/22px 22px 0 0;z-index:5";
+  scene.appendChild(sand);
+  [6,28,58,82,91].forEach((x,i)=>{ const sw=document.createElement("div"); sw.className="seaweed"; sw.style.cssText=`left:${x}%;height:${45+Math.random()*80}px;animation-delay:${i*0.45}s;z-index:4`; scene.appendChild(sw); });
+  for(let i=0;i<10;i++){ const b=document.createElement("div"); b.className="bubble"; b.style.cssText=`left:${15+Math.random()*70}%;width:${4+Math.random()*5}px;height:${4+Math.random()*5}px;animation-duration:${2+Math.random()*3}s;animation-delay:${Math.random()*4}s;z-index:7`; scene.appendChild(b); }
+  [{emoji:"🐠",top:18,dur:13,dir:"r"},{emoji:"🐡",top:40,dur:17,dir:"l"},{emoji:"🐟",top:55,dur:15,dir:"l"}].forEach(f=>{ const el=document.createElement("div"); el.className="fish"+(f.dir==="l"?" left":""); el.textContent=f.emoji; el.style.cssText=`top:${f.top}%;font-size:24px;animation-duration:${f.dur}s;z-index:8`; scene.appendChild(el); });
+}
+
+/* ════════════════════════════════════════════
+   CLOCK + UPTIME
+════════════════════════════════════════════ */
+function updateClock() {
+  const now  = new Date();
+  const days = ["Chủ Nhật","Thứ Hai","Thứ Ba","Thứ Tư","Thứ Năm","Thứ Sáu","Thứ Bảy"];
+  document.getElementById("datetimeText").textContent = `${days[now.getDay()]} • ${now.toLocaleTimeString("vi-VN")}`;
+}
+setInterval(updateClock, 1000);
+
+/* ════════════════════════════════════════════
+   INIT
+════════════════════════════════════════════ */
+document.addEventListener("DOMContentLoaded", () => {
+  if (localStorage.getItem("beca_dark_mode") === "true") {
+    document.body.classList.add("dark");
+  }
+  initCharts();
+  buildFishScene();
+  updateThresholdSlider();
+  updateMuteUI();
+  document.getElementById("tgToken").value  = tgToken;
+  document.getElementById("tgChatId").value = tgChatId;
+  document.getElementById("tgWebAlertsToggle").checked = webTelegramAlerts;
+  
+  const k1 = document.getElementById("groqKey");
+  if (k1) k1.value = groqApiKey;
+  const k2 = document.getElementById("groqKey2");
+  if (k2) k2.value = groqApiKey;
+});
+</script>
+</body>
+</html>
